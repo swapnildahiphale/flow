@@ -187,10 +187,11 @@ handles the rest.
 ## What you get
 
 - **One task, one Claude session, one tab.** `flow do <task>`
-  spawns a dedicated tab in iTerm2, stock macOS Terminal, or your
-  current zellij session (requires zellij ≥ 0.40) — flow picks
-  whichever you launched it from. Tomorrow's `flow do <task>`
-  resumes the same conversation.
+  spawns a dedicated tab in iTerm2, Warp, stock macOS Terminal, or
+  your current zellij session (requires zellij ≥ 0.40) — flow picks
+  whichever you launched it from. Override with
+  `FLOW_TERM=warp|iterm|terminal|zellij` when you're on a non-standard
+  host. Tomorrow's `flow do <task>` resumes the same conversation.
 - **Interview-driven task capture.** No forms. flow asks
   what / why / where / done-when, then writes a structured brief.
 - **A knowledge base that grows.** Five markdown buckets for
@@ -208,10 +209,12 @@ handles the rest.
 ## How it works under the hood
 
 `flow do <task>` pre-allocates a session UUID, writes it to the
-task row, and spawns a tab in zellij (when `$ZELLIJ` is set), iTerm2,
-or stock Terminal.app — chosen in that priority order, with iTerm as
-the historical fallback — running `claude --session-id <uuid>` with
-`FLOW_TASK` / `FLOW_PROJECT` inlined. The jsonl file lands at the deterministic path
+task row, and spawns a tab in zellij (when `$ZELLIJ` is set), the
+backend named in `$FLOW_TERM` (when set), Warp / iTerm2 / stock
+Terminal.app (auto-detected from `$TERM_PROGRAM`) — chosen in that
+priority order, with iTerm as the historical fallback — running
+`claude --session-id <uuid>` with `FLOW_TASK` / `FLOW_PROJECT` inlined.
+The jsonl file lands at the deterministic path
 `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, so future
 `flow do` calls run `claude --resume <uuid>` to continue the same
 conversation. A SessionStart hook re-injects the task brief,
@@ -293,11 +296,11 @@ and reinstall the skill + hook.
 
 ## Where flow runs (and where we'd love help)
 
-Today flow runs on **macOS (iTerm2, stock Terminal.app, or zellij)
-+ Claude Code only**. That's the stack we use, and that's what the
-session-spawn layer was built and tested against. zellij works on
-Linux too as a side effect — it's cross-platform and flow's zellij
-backend doesn't depend on any macOS APIs.
+Today flow runs on **macOS (iTerm2, Warp, stock Terminal.app, or
+zellij) + Claude Code only**. That's the stack we use, and that's
+what the session-spawn layer was built and tested against. zellij
+works on Linux too as a side effect — it's cross-platform and flow's
+zellij backend doesn't depend on any macOS APIs.
 
 The architecture is portable — session spawning is one small
 package — but other harnesses (Codex, Cursor, plain shell) and other
