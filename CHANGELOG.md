@@ -7,6 +7,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- **Warp as a first-class spawn backend.** `flow do` opens new tabs in
+  Warp when invoked from a Warp shell (`TERM_PROGRAM=WarpTerminal`).
+  Selection priority is now `$ZELLIJ` → `$FLOW_TERM` → `WarpTerminal`
+  / `Apple_Terminal` / `iTerm.app` → iTerm-default. Warp has no
+  AppleScript dictionary, no `-e` flag, and no command-running CLI —
+  so the backend opens a tab via `warp://action/new_tab?path=<cwd>`
+  and delivers the bootstrap by keystroking the path to a
+  self-deleting `/var/folders/.../flow-warp-<uuid>.sh` script via
+  osascript. Submission uses `keystroke (ASCII character 13)` rather
+  than `key code 36` / `keystroke return` because Warp v0.2026.04
+  filters synthetic Return-key events for ~2s after typed input;
+  pushing the CR through as a typed character flows through to the
+  shell PTY before the UI-layer filter can fire. Requires macOS
+  Accessibility for Warp (same gate as the Terminal.app backend).
+  Friendly errors when Warp isn't installed (`LSApplicationNotFoundErr`)
+  or when Accessibility isn't granted, pointing at the right System
+  Settings pane.
+- **`FLOW_TERM` env override.** Set `FLOW_TERM=warp|iterm|terminal|zellij`
+  to force a specific spawn backend regardless of `$TERM_PROGRAM`.
+  Useful when running flow from a non-standard host (tmux inside Warp,
+  shell scripts, Hyper, wezterm). `$ZELLIJ` still wins — if you're
+  inside a zellij session, that's where new tabs go. Unrecognized
+  values silently fall through to `$TERM_PROGRAM` detection.
+
 ## [0.1.0-alpha.8] — 2026-05-09
 
 ### Added
