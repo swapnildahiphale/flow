@@ -7,3 +7,6 @@
 # running the CLI with a relative FLOW_ROOT.
 /projects/
 /tasks/
+
+# Personal Claude Code settings — model pin, per-user overrides.
+/.claude/settings.local.json
