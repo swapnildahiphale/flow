@@ -82,12 +82,45 @@ Empirically this is ~5–10% of results.
 
 ### 5. Group messages by channel / chat
 
-Parse each message's channel display name or chat name from the response.
-Group all gate-passing messages by channel, preserving arrival order within each group.
-Apply the exclusion list: drop entire channel groups whose display name matches any
-entry from step 2 (case-insensitive substring).
+**MCP response shape note (verified by Tier 2 smoke test):** the response does NOT
+include a human-readable channel display name. Each message carries:
+- `chatId` — opaque GUID (e.g. `19:meeting_<base64>@thread.v2`, or
+  `19:<hex>@thread.v2`, or `19:<uuid>_<uuid>@unq.gbl.spaces` for DMs)
+- `chatUri` — same identifier wrapped in a `teams://` URL
+- `subject` — always null in observed responses; do not rely on it
 
-Record per-channel message counts for the digest header.
+**Grouping strategy:**
+
+Group all gate-passing messages by `chatId` as the canonical channel key.
+Preserve arrival order within each group. Each chatId yields one "channel" group
+for the rest of the pipeline.
+
+**Synthesizing a display name for each chatId** (used by the digest in step 11):
+
+The chatId is opaque, so derive a short human label from the *content* of the
+messages once classification has run (step 7) — typically the dominant topic
+slug plus a "chat" suffix (e.g. `eks-security-groups chat`, `AVA platform chat`).
+This label is just for digest readability; the chatId remains the stable
+identifier in topic-file frontmatter (`channels:` list).
+
+**DM detection:**
+
+If `chatId` ends with `@unq.gbl.spaces`, this is a 1:1 direct message, not a
+group chat. Label it as `DM: <other-participant>` using the `from.displayName`
+of the most recent message (best available proxy for the other side of the DM).
+DMs go through the same topic classification as group chats — there is no
+separate "DMs section" in the digest; topics span both.
+
+**Exclusion list:**
+
+Apply the exclusion list (step 2). Match each chat's *synthesized display name*
+(from step 7's classification, available by the time we filter for output) and
+its chatId against any entry. Exclusion uses case-insensitive substring matching.
+If a chat's display name is unstable across runs (because it derives from content),
+the user can also exclude by chatId verbatim — the brief preserves chatId
+in `topics/<slug>.md` frontmatter so users can copy it.
+
+Record per-chatId message counts for the digest header.
 
 ### 6. Noise pre-filter (per channel)
 
@@ -140,6 +173,9 @@ resolution prompt — never silently rewrite `summary:`.
   from VM-based Jenkins to EKS-hosted runners.")
 - `key_excerpts`: 2–3 most salient message quotes (truncated to ~120 chars each)
 - `mentioned_people`: names / @handles that appeared in the messages
+- `has_high_importance`: true if ANY message in this topic carries
+  `importance: "high"` in the MCP response. Surface these prominently in the
+  digest (step 11 prefixes high-importance excerpts with a `⚡` marker).
 - `drifted_from_summary`: true | false (default false; true only for existing
   topics whose narrative has clearly moved off the original `summary:`)
 
@@ -269,6 +305,10 @@ What decision was made or what is still open?>
 **Excerpts:**
 - "<quote1>" — <Sender>, <time IST>
 - "<quote2>" — <Sender>, <time IST>
+
+(Prefix any excerpt from an `importance: "high"` message with `⚡` so it stands
+out. Topics where `has_high_importance: true` may also benefit from a `⚡` next
+to the topic title.)
 
 [→ Topic details](~/.flow/playbooks/teams-morning-digest/topics/<slug>.md)
 
@@ -434,3 +474,12 @@ be archived manually or via a future cleanup routine.
 - **Classifier reading too many topic files (Pass 2 frequency)**: if Pass 2 fires for
   most channels, `topics.md` one-liners are not descriptive enough. Rewrite them to
   be more disambiguating (manual edit, or fold into a future refinement pass).
+- **Channel display names diverging across runs**: because display names are
+  synthesized from content (step 5), the same chatId may get different labels
+  across runs as discussion shifts. This is fine for digest readability but means
+  display names are NOT stable identifiers — use chatId for exclusion-list entries
+  and `channels:` frontmatter, never the synthesized label alone.
+- **DM volume spikes**: DM topics can dominate the digest if a single 1:1
+  discussion gets lengthy. The brief intentionally classifies DMs alongside
+  group chats — if you find you want DMs separated, add `unq.gbl.spaces`-suffixed
+  chatIds to `channels-excluded.md` for the noisy ones.
