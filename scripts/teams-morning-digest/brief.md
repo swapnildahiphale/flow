@@ -105,17 +105,45 @@ Keep a per-channel noise count for the digest noise-summary section.
 
 ### 7. Per-channel topic classification
 
-For each channel with at least one substantive message, classify inline (use your own
-LLM reasoning — no external API call needed):
+For each channel with at least one substantive message, classify inline using a
+**two-pass approach** to keep token cost bounded as the topic store grows.
 
-> "Given these messages in <channel> and the existing topic slugs in topics.md,
-> which topics were discussed? For each topic:
-> - topic_slug: existing slug from topics.md, OR a new lowercase-kebab 2–4 word slug
-> - is_new: true if not in topics.md
-> - brief_summary: 1–2 sentences — what happened with this topic today
-> - key_excerpts: 2–3 most salient message quotes (truncated to ~120 chars each)
-> - mentioned_people: names / @handles that appeared in the messages
-> Mark messages as part of topic 'noise' only if they do not fit any meaningful topic."
+**Pass 1 — index scan.**
+Read `topics.md` once (already loaded, cache). For each channel's substantive
+messages, propose candidate topic slugs based solely on the one-line index
+entries. Most cases resolve here: a clear new topic gets a new slug; a clear
+existing topic gets matched by slug.
+
+**Pass 2 — frontmatter disambiguation (only when needed).**
+If Pass 1 leaves ambiguity (the discussion could plausibly belong to 2+
+existing topics, OR matches by slug but the one-liner is too thin to confirm
+the fit), `Read` the candidate topic files with `limit: 15` — this grabs only
+the frontmatter (slug, summary, current-focus, channels, key-people,
+last-seen). Use `summary:` to make the final call. Do NOT read the full body
+at this stage; that happens in step 8 once a topic is confirmed.
+
+**Drift detection** (applies to existing topics matched in Pass 1 or 2):
+compare today's discussion narrative against the matched topic's `summary:`
+(if loaded) or its one-line index entry. If the discussion fits the slug but
+**diverges meaningfully** from the summary (e.g. `jenkins-security` topic now
+discussing k8s migration, not security incidents), set `drifted_from_summary: true`
+on the classification output. Drifted topics are queued for the step 15
+resolution prompt — never silently rewrite `summary:`.
+
+**Classification output (per topic):**
+- `topic_slug`: existing slug or new lowercase-kebab 2–4 word slug
+- `is_new`: true if not in topics.md
+- `brief_summary`: 1–2 sentences — what happened with this topic today
+- `current_focus_line`: one line — where the discussion is heading right now
+- `proposed_summary`: only when `is_new` — 1–2 sentences, the stable definition
+  of what this topic fundamentally is (e.g. "Migration of the HIX platform
+  from VM-based Jenkins to EKS-hosted runners.")
+- `key_excerpts`: 2–3 most salient message quotes (truncated to ~120 chars each)
+- `mentioned_people`: names / @handles that appeared in the messages
+- `drifted_from_summary`: true | false (default false; true only for existing
+  topics whose narrative has clearly moved off the original `summary:`)
+
+Mark messages as part of topic `noise` only if they do not fit any meaningful topic.
 
 **New topic slug rules:**
 - Lowercase, kebab-case, 2–4 words.
@@ -152,6 +180,11 @@ For each new topic (`is_new = true` from step 7):
 slug: <slug>
 first-seen: YYYY-MM-DD
 last-seen: YYYY-MM-DD
+summary: <from classification's proposed_summary — 1–2 sentences, the STABLE
+          definition of what this topic fundamentally is. Rarely rewritten;
+          only changes on an explicit rename in step 15.>
+current-focus: <from classification's current_focus_line — one line, where
+                the discussion is right now. OVERWRITTEN every active run.>
 channels:
   - <channel-name>
 key-people:
@@ -159,8 +192,9 @@ key-people:
 ---
 
 ## Context
-<2–3 sentence summary of what this topic is about, derived from classification
-and any hydration. What is the thing, why does it matter to this team?>
+<2–3 sentence longer-form background, derived from classification and any
+hydration. What is the thing, why does it matter to this team? This is
+narrative context for human readers; the classifier uses `summary:` instead.>
 
 ## Key history
 - YYYY-MM-DD: <Initial entry summarising today's messages>
@@ -171,6 +205,18 @@ and any hydration. What is the thing, why does it matter to this team?>
 ## Last activity
 YYYY-MM-DD in #<channel-name>: <one-line summary>
 ```
+
+**Why three time horizons** (`summary:` / `current-focus:` / `Key history`):
+- `summary:` is **stable** — what this topic IS. Cheap for the classifier
+  to read; only rewritten on explicit user action (rename/split in step 15).
+- `current-focus:` is **mutable** — where the discussion is THIS run.
+  Overwritten every active run by step 12.
+- `Key history` is **append-only** — the full chronology of dated entries.
+  Never edited; always grows.
+
+The classifier scans `summary:` + `current-focus:` from frontmatter (cheap)
+to make routing decisions; the body is only read when a topic is confirmed
+active and needs full context.
 
 3. Append to `topics.md`:
 ```
@@ -269,7 +315,7 @@ _(none detected)_
 _(none)_
 ```
 
-### 12. Update existing topic files (append-only)
+### 12. Update existing topic files
 
 For each topic that was **not new** this run but had activity (appeared in step 7):
 1. Read the topic file.
@@ -278,11 +324,23 @@ For each topic that was **not new** this run but had activity (appeared in step 
    - YYYY-MM-DD: <one-line summary of what happened today>
    ```
 3. **Update** "Last activity" line (the entire last line of the file — overwrite).
-4. **Update** frontmatter: set `last-seen: YYYY-MM-DD`; add any new channels to the
-   `channels:` list if they aren't already there; add new people to `key-people:` if applicable.
+4. **Update** frontmatter:
+   - `last-seen: YYYY-MM-DD` (today).
+   - `current-focus:` — **overwrite** with the classification's
+     `current_focus_line` from step 7. This is the mutable field; it should
+     reflect today's discussion direction, not yesterday's.
+   - Add any new channels to `channels:` if not already present.
+   - Add any new people to `key-people:` if applicable.
+5. **Do NOT touch `summary:`.** It is the stable identity of the topic and
+   only changes via the explicit step 15 drift-resolution prompt.
 
-DO NOT edit or rewrite any prior "Key history" entries. This file is append-only history.
-New topic files were already written in step 9 — do not re-process them here.
+DO NOT edit or rewrite any prior "Key history" entries. The history list is
+append-only. New topic files were already written in step 9 — do not
+re-process them here.
+
+**Drift queue:** if step 7 flagged this topic with `drifted_from_summary: true`,
+add it to the `drifted_topics` list to be surfaced in step 15. Do not act on
+the drift here — the user owns the rename/split call.
 
 ### 13. Update topics.md index
 
@@ -301,6 +359,28 @@ Do this **only after** the digest file has been successfully written to disk.
 If the digest write failed for any reason, do not advance the watermark.
 
 ### 15. End-of-run interactive prompts
+
+**Drifted topics** (if any were flagged with `drifted_from_summary: true` in step 7):
+
+For each drifted topic, show the user:
+- The topic's current `summary:` (what it was about).
+- A one-line description of where today's discussion went.
+
+Use `AskUserQuestion` (header: "Topic drift") with options:
+- **"Rename topic"** — prompt for a new slug + new `summary:`. Rewrite the
+  topic file's frontmatter (`slug:`, `summary:`); rename the file on disk;
+  update the corresponding line in `topics.md`. Add a `Key history` entry:
+  `- YYYY-MM-DD: Renamed from <old-slug> — <reason>`. Existing chronology
+  is preserved.
+- **"Split into new topic"** — create a new topic file (full step 9 path)
+  with a fresh slug and summary capturing the new direction. In the old
+  topic's `Key history`, append: `- YYYY-MM-DD: Discussion forked to
+  [<new-slug>](<new-slug>.md) — future activity tracked there.` Mark the
+  old topic with `⚠ forked` in `topics.md`. Today's run continues to log
+  in the old topic; future runs will classify into the new one.
+- **"Keep as-is"** — do nothing. Drift is acknowledged but the topic
+  identity remains useful. The flag is not persisted; future runs
+  re-evaluate.
 
 **Candidate KB updates** (if any were identified in step 11):
 
@@ -347,3 +427,10 @@ be archived manually or via a future cleanup routine.
   the window just covers the gap. No manual watermark reset needed.
 - **Topics.md growing stale**: scan `⚠ stale` markers periodically and archive or merge
   inactive topics manually (edit topics.md, move the file to a backup location).
+- **Drift prompts firing every run**: if the same topic keeps getting flagged as drifted
+  but the user keeps picking "Keep as-is", the `summary:` is too narrow. Tighten the
+  step 7 drift heuristic, or prompt the user to rename — the persistent flag is a
+  signal that the stable definition no longer matches reality.
+- **Classifier reading too many topic files (Pass 2 frequency)**: if Pass 2 fires for
+  most channels, `topics.md` one-liners are not descriptive enough. Rewrite them to
+  be more disambiguating (manual edit, or fold into a future refinement pass).
