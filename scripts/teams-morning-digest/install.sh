@@ -57,27 +57,58 @@ fi
 
 # Do NOT seed watermark.md — its absence signals "first run → 14-day lookback".
 
-# 5. Done.
+# 5. Install runner script (idempotent — always overwrite, source of truth in repo).
+RUNNER_DIR="$HOME/.flow/scripts"
+RUNNER_SCRIPT="$RUNNER_DIR/teams-morning-digest-runner.sh"
+mkdir -p "$RUNNER_DIR"
+cp "$SRC_DIR/runner.sh" "$RUNNER_SCRIPT"
+chmod +x "$RUNNER_SCRIPT"
+
+# 6. Install LaunchAgent plist. Expand $HOME so the plist has absolute paths
+#    (launchd does NOT expand env vars inside ProgramArguments strings).
+LAUNCHAGENT_DIR="$HOME/Library/LaunchAgents"
+LAUNCHAGENT_LABEL="com.swapnil.flow.teams-morning-digest"
+LAUNCHAGENT_PLIST="$LAUNCHAGENT_DIR/${LAUNCHAGENT_LABEL}.plist"
+mkdir -p "$LAUNCHAGENT_DIR"
+sed "s#\$HOME#$HOME#g" "$SRC_DIR/${LAUNCHAGENT_LABEL}.plist" > "$LAUNCHAGENT_PLIST"
+
+# 7. Reload the LaunchAgent (unload-if-loaded, then load).
+if launchctl list | grep -q "$LAUNCHAGENT_LABEL"; then
+  launchctl unload "$LAUNCHAGENT_PLIST" 2>/dev/null || true
+fi
+launchctl load "$LAUNCHAGENT_PLIST"
+
+# 8. Done.
 cat <<DONEEOF
 
 Install complete.
 
-Files installed / updated:
-  $PLAYBOOK_DIR/brief.md  (source of truth for each run)
-  $PLAYBOOK_DIR/topics/   (per-topic state files; empty on first install)
-  $PLAYBOOK_DIR/digests/  (daily digest output; empty on first install)
+Playbook files:
+  $PLAYBOOK_DIR/brief.md          (source of truth for each run)
+  $PLAYBOOK_DIR/topics/           (per-topic state files)
+  $PLAYBOOK_DIR/digests/          (daily digest output)
 
 Seeded (first install only, not overwritten on re-run):
   $PLAYBOOK_DIR/channels-excluded.md
   $PLAYBOOK_DIR/topics.md
 
+Scheduler:
+  $RUNNER_SCRIPT
+  $LAUNCHAGENT_PLIST  (loaded)
+
+Fires at 08:00 local Mon–Fri. If the laptop is closed at 08:00, the run
+catches up on next wake (launchd coalesces missed StartCalendarInterval
+events). The runner script is idempotent: weekend/before-8/digest-already-
+exists all short-circuit it.
+
 watermark.md: absent → first run will do a 14-day lookback and seed the topic store.
 
-To run the playbook:
+Logs:
+  tail -f $PLAYBOOK_DIR/runner.log
+
+Trigger a manual run now:
   flow run playbook teams-morning-digest
 
-First run note:
-  The 14-day lookback may fetch 500+ messages and take several minutes.
-  After the first run, review $PLAYBOOK_DIR/channels-excluded.md
-  and add noisy channels (CI builds, social, etc.) to keep future runs focused.
+Disable the schedule:
+  launchctl unload $LAUNCHAGENT_PLIST
 DONEEOF

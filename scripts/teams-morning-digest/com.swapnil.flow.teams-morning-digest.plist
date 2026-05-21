@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.swapnil.flow.teams-morning-digest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>$HOME/.flow/scripts/teams-morning-digest-runner.sh</string>
+    </array>
+
+    <!-- Fire at 08:00 local time, Monday through Friday.
+         macOS launchd coalesces missed StartCalendarInterval events into one
+         fire when the laptop wakes, so a closed laptop at 08:00 will catch up
+         on next wake. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>8</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>2</integer>
+            <key>Hour</key><integer>8</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>3</integer>
+            <key>Hour</key><integer>8</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>4</integer>
+            <key>Hour</key><integer>8</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>5</integer>
+            <key>Hour</key><integer>8</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+    </array>
+
+    <!-- Belt + suspenders: also fire on agent load (i.e. user login).
+         The runner script's idempotency check (weekend / before 8 / digest
+         already exists) makes spurious fires harmless. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Capture stdout/stderr to the same file the runner already appends to. -->
+    <key>StandardOutPath</key>
+    <string>/Users/swapnil/.flow/playbooks/teams-morning-digest/runner.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/swapnil/.flow/playbooks/teams-morning-digest/runner.log</string>
+</dict>
+</plist>

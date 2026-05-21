@@ -368,6 +368,18 @@ because asks-of-you matter more than ambient context.
 
 ---
 
+## Drifted topics — needs review   <!-- only if any topic has drifted_from_summary: true; omit section otherwise -->
+
+<!-- For each drifted topic: surface for user review. No file changes happen
+     automatically — user decides and edits manually (or asks Claude in a
+     follow-up session). -->
+
+- **`<slug>`** — current `summary:` says: _"<existing summary>"_
+  Today's discussion went: _"<one-line where it actually went>"_
+  Options: rename topic + rewrite summary | split into new topic + back-reference | keep as-is
+
+---
+
 ## What's new today
 
 <!-- One bullet per active topic. Topic name is a clickable markdown link to the
@@ -495,50 +507,38 @@ Write `window_end` (UTC, ISO 8601) as a single line to
 Do this **only after** the digest file has been successfully written to disk.
 If the digest write failed for any reason, do not advance the watermark.
 
-### 15. End-of-run interactive prompts
+### 15. Headless exit — no interactive prompts
 
-**Drifted topics** (if any were flagged with `drifted_from_summary: true` in step 7):
+**The digest runs headless by design.** This playbook is wired to a LaunchAgent
+that fires at 08:00 IST on weekdays (or on next login after 08:00 if the laptop
+was closed) — there is no user to answer `AskUserQuestion`. Step 15 therefore
+does **NOT** call any interactive prompt.
 
-For each drifted topic, show the user:
-- The topic's current `summary:` (what it was about).
-- A one-line description of where today's discussion went.
+Every category of "thing the user might want to act on" is rendered into the
+digest body by step 11, so the user reviews and acts at their own pace by
+reading the digest:
 
-Use `AskUserQuestion` (header: "Topic drift") with options:
-- **"Rename topic"** — prompt for a new slug + new `summary:`. Rewrite the
-  topic file's frontmatter (`slug:`, `summary:`); rename the file on disk;
-  update the corresponding line in `topics.md`. Add a `Key history` entry:
-  `- YYYY-MM-DD: Renamed from <old-slug> — <reason>`. Existing chronology
-  is preserved.
-- **"Split into new topic"** — create a new topic file (full step 9 path)
-  with a fresh slug and summary capturing the new direction. In the old
-  topic's `Key history`, append: `- YYYY-MM-DD: Discussion forked to
-  [<new-slug>](<new-slug>.md) — future activity tracked there.` Mark the
-  old topic with `⚠ forked` in `topics.md`. Today's run continues to log
-  in the old topic; future runs will classify into the new one.
-- **"Keep as-is"** — do nothing. Drift is acknowledged but the topic
-  identity remains useful. The flag is not persisted; future runs
-  re-evaluate.
+| Candidate | Where it appears in the digest |
+|-----------|-------------------------------|
+| Untracked action items | `## Asks of you` section (top of digest) |
+| Drifted topics needing rename / split | `## Drifted topics — needs review` section (just under Asks of you) |
+| KB-worthy facts | `## Candidate KB updates` section (bottom of digest) |
 
-**Candidate KB updates** (if any were identified in step 11):
+These sections are skipped (header + section both omitted) when the category is
+empty, so a calm morning's digest stays short.
 
-Use `AskUserQuestion` (header: "KB updates?"):
-- "Approve all" — append each to the matching `~/.flow/kb/<file>.md` in scoop-mode
-  format: `- YYYY-MM-DD — <paraphrase>`.
-- "Review one by one" — AskUserQuestion per item with "Add it" / "Skip this one".
-- "Skip all" — do nothing; the candidates are preserved in the digest file.
+**Drift handling specifics:** when `drifted_from_summary: true` for an existing
+topic, do NOT modify the topic file's `summary:` or rename anything. Just
+surface the drift in the digest's `## Drifted topics — needs review` section
+with: the slug, the current `summary:`, a one-line note about where today's
+discussion went, and the two options (rename / split). The user reviews and
+manually edits the topic file / `topics.md` (or asks Claude in a follow-up
+session to do it). The `drifted_from_summary` flag is not persisted — future
+runs re-evaluate.
 
-**Untracked action items** (if any `[not tracked]` items were detected in step 10):
-
-Use `AskUserQuestion` (header: "Create tasks?"):
-- "Create tasks for untracked items" — for each untracked item, run the §4.2
-  task-intake interview from the flow skill. Pre-fill the What field from the
-  action-item excerpt.
-- "Skip — I'll handle manually" — stop here.
-
-**After all prompts: exit WITHOUT calling `flow done`.**
-Daily digest runs should not trigger the close-out KB sweep — it's expensive and
-adds noise to the KB for routine runs. The run-task accumulates in backlog and can
-be archived manually or via a future cleanup routine.
+**After step 14: exit.** Do not call `flow done`. Daily digest runs accumulate
+playbook-run tasks in backlog; clean those up manually or via a future cleanup
+routine. The flow task itself stays open as the playbook's home base.
 
 ## Out of scope
 - Sending, replying, or reacting on Teams (read-only, always).
