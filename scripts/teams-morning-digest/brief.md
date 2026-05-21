@@ -93,9 +93,25 @@ include a human-readable channel display name. Each message carries:
 
 Group all gate-passing messages by `chatId` as the canonical channel key.
 Preserve arrival order within each group. Each chatId yields one "channel" group
-for the rest of the pipeline. **Also keep each chat's `chatUri`** — needed for
-the `[Open in Teams →]` deep link in step 11. The chatUri opens the chat
-directly in the user's Teams desktop app.
+for the rest of the pipeline.
+
+**Anchor message ID per chat (for the `[Open in Teams →]` deep link).**
+The MCP's `chatUri` is a representational URI (`teams:///...`), NOT a clickable
+deep link — Teams doesn't register that scheme on macOS and Microsoft has
+deprecated the classic-Teams hash-route URL. The working deep link format is:
+
+```
+https://teams.microsoft.com/l/message/<URL-encoded-chatId>/<messageId>?context=%7B%22contextType%22%3A%22chat%22%7D
+```
+
+This requires a **specific messageId** as an anchor. For each chatId, capture
+the `id` field of its most recent substantive message (post-noise-filter) — call
+this `anchor_message_id`. Step 9 stores it; step 11 constructs the URL from
+`https://teams.microsoft.com/l/message/<chatId>/<anchor_message_id>?context=...`.
+
+The user lands on the anchor message and can scroll up/down from there. Clicking
+this URL on macOS opens browser → prompts "Open in Microsoft Teams?" (one-time
+preference checkbox makes it skip the prompt thereafter).
 
 **Synthesizing a display name for each chatId** (used by the digest in step 11):
 
@@ -287,8 +303,8 @@ current-focus: <from classification's current_focus_line — one line, where
                 the discussion is right now. OVERWRITTEN every active run.>
 channels:
   - "<chatId> (<synthesized display name>)"
-channel-uris:
-  - "<chatUri verbatim from MCP>"   # used by step 11 for [Open in Teams →] links
+channel-links:
+  - "https://teams.microsoft.com/l/message/<URL-encoded chatId>/<anchor_message_id>?context=%7B%22contextType%22%3A%22chat%22%7D"
 key-people:
   - <names from key_excerpts if identifiable>
 ---
@@ -416,10 +432,11 @@ What decision was made or what is still open?>
 
 (Prefix any excerpt from an `importance: "high"` message with `⚡`.)
 
-[→ Full topic file](../topics/<slug>.md) · [Open in Teams →](<chatUri-from-frontmatter>)
+[→ Full topic file](../topics/<slug>.md) · [Open in Teams →](<channel-link-from-frontmatter>)
 
 <!-- If the topic spans multiple channels, render one [Open in Teams →] link
-     per chatUri in the topic's channel-uris list, separated by ` · `. -->
+     per URL in the topic's channel-links list, separated by ` · `. Each URL
+     is the constructed https://teams.microsoft.com/l/message/... deep link. -->
 
 ---
 
