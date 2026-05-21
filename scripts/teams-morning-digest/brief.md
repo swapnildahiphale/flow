@@ -93,7 +93,9 @@ include a human-readable channel display name. Each message carries:
 
 Group all gate-passing messages by `chatId` as the canonical channel key.
 Preserve arrival order within each group. Each chatId yields one "channel" group
-for the rest of the pipeline.
+for the rest of the pipeline. **Also keep each chat's `chatUri`** — needed for
+the `[Open in Teams →]` deep link in step 11. The chatUri opens the chat
+directly in the user's Teams desktop app.
 
 **Synthesizing a display name for each chatId** (used by the digest in step 11):
 
@@ -188,8 +190,38 @@ resolution prompt — never silently rewrite `summary:`.
 - `has_high_importance`: true if ANY message in this topic carries
   `importance: "high"` in the MCP response. Surface these prominently in the
   digest (step 11 prefixes high-importance excerpts with a `⚡` marker).
+- `movement`: one of `new`, `worse`, `better`, `same`. Computed by comparing
+  today's topic state to the most recent prior digest (see "Movement
+  detection" sub-step below). Drives the ↑/↓/→/🆕 marker in the digest.
 - `drifted_from_summary`: true | false (default false; true only for existing
   topics whose narrative has clearly moved off the original `summary:`)
+
+**Movement detection sub-step.**
+
+Before composing the digest, locate the most recent prior digest:
+
+1. List `~/.flow/playbooks/teams-morning-digest/digests/`. Filter for files
+   matching strict `YYYY-MM-DD.md` (ignore suffix variants like
+   `YYYY-MM-DD-tier2.md` from smoke runs).
+2. Pick the file with the highest date strictly less than today's digest date.
+3. If none exists, this is the first-ever digest — every active topic gets
+   `movement: new`. Skip the rest of the sub-step.
+4. Otherwise, read the prior digest. For each active topic in today's run:
+   - Locate its bullet in the prior digest's "What's new today" section
+     (match by exact slug in the markdown link).
+   - If the slug is not in the prior digest's "What's new today", set
+     `movement: new`.
+   - Otherwise, compare today's headline (the one-line summary you'll put in
+     "What's new today") against yesterday's bullet text. Use these signals:
+     - **worse**: new failure modes mentioned, scope expanded, deadline
+       slipped, escalation language, "still", "again", "again still"
+     - **better**: resolution language, "fixed", "resolved", "unblocked",
+       "merged", scope narrowed, root cause identified
+     - **same**: same state, no new info; topic re-appeared because of fresh
+       chatter but no substantive change
+   - Set `movement` accordingly.
+
+This is a single LLM judgment call per active topic — cheap.
 
 Mark messages as part of topic `noise` only if they do not fit any meaningful topic.
 
@@ -254,7 +286,9 @@ summary: <from classification's proposed_summary — 1–2 sentences, the STABLE
 current-focus: <from classification's current_focus_line — one line, where
                 the discussion is right now. OVERWRITTEN every active run.>
 channels:
-  - <channel-name>
+  - "<chatId> (<synthesized display name>)"
+channel-uris:
+  - "<chatUri verbatim from MCP>"   # used by step 11 for [Open in Teams →] links
 key-people:
   - <names from key_excerpts if identifiable>
 ---
@@ -337,13 +371,21 @@ because asks-of-you matter more than ambient context.
 ## What's new today
 
 <!-- One bullet per active topic. Topic name is a clickable markdown link to the
-     topic file. Prefix with ⚡ if has-high-importance: true. End with a tag list
-     of any people you should know are involved if relevant. -->
+     topic file.
 
-- ⚡ [`<slug>`](../topics/<slug>.md) — <one-line headline of today's update; what
+     Per-bullet markers (in this order, left to right):
+       ⚡  has-high-importance: true
+       🆕  movement: new       (topic didn't exist in prior digest)
+       ↑   movement: worse     (situation deteriorated since prior digest)
+       ↓   movement: better    (improved / progressing toward resolution)
+       →   movement: same      (no substantive change; topic just had fresh chatter)
+
+     Always emit exactly one movement marker per bullet. Stack ⚡ first if present. -->
+
+- ⚡ ↑ [`<slug>`](../topics/<slug>.md) — <one-line headline of today's update; what
   changed, what's still open. Keep under 120 chars.>
-- [`<slug>`](../topics/<slug>.md) — <headline>
-- [`<slug>`](../topics/<slug>.md) — <headline>
+- 🆕 [`<slug>`](../topics/<slug>.md) — <headline>
+- ↓ [`<slug>`](../topics/<slug>.md) — <headline>
 
 ---
 
@@ -362,7 +404,10 @@ What decision was made or what is still open?>
 
 (Prefix any excerpt from an `importance: "high"` message with `⚡`.)
 
-[→ Full topic file](../topics/<slug>.md)
+[→ Full topic file](../topics/<slug>.md) · [Open in Teams →](<chatUri-from-frontmatter>)
+
+<!-- If the topic spans multiple channels, render one [Open in Teams →] link
+     per chatUri in the topic's channel-uris list, separated by ` · `. -->
 
 ---
 
