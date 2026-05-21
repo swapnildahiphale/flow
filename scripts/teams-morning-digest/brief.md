@@ -314,20 +314,42 @@ Compute all timestamps in IST for display (UTC + 5:30). Display format: `YYYY-MM
 Write `~/.flow/playbooks/teams-morning-digest/digests/<YYYY-MM-DD>.md` with
 this exact structure. Also echo the full content to terminal.
 
+**Design intent.** The digest is built for a 30-second skim. The top section
+(`What's new today`) is one bullet per active topic with a clickable link to
+the full topic file. Everything below is drill-down — only read if the bullet
+catches your eye. Anything addressed to the user surfaces ABOVE the skim list,
+because asks-of-you matter more than ambient context.
+
 ```markdown
 # Teams morning digest — <YYYY-MM-DD>
 
-> **Window:** <window_start IST> → <window_end IST>
-> **Messages reviewed:** <total after createdDateTime gate>  
-> **Channels touched:** <non-excluded channels with at least one substantive message>  
-> **Topics active:** <topics seen this run that existed before>  
-> **Topics new:** <new topics created this run>
+> **Window:** <window_start IST> → <window_end IST> | **Messages:** <N after gate> | **Topics:** <active> active, <new> new | **High-importance:** <count>
 
 ---
 
-## Active topics
+## Asks of you   <!-- only if action_items_list is non-empty; omit section otherwise -->
 
-### <Topic display name> (`<slug>`)
+- **[tracked as `<slug>`]** / **[not tracked]** — _<Sender>_ in #<channel>, <time IST>
+  > "<excerpt>"
+
+---
+
+## What's new today
+
+<!-- One bullet per active topic. Topic name is a clickable markdown link to the
+     topic file. Prefix with ⚡ if has-high-importance: true. End with a tag list
+     of any people you should know are involved if relevant. -->
+
+- ⚡ [`<slug>`](../topics/<slug>.md) — <one-line headline of today's update; what
+  changed, what's still open. Keep under 120 chars.>
+- [`<slug>`](../topics/<slug>.md) — <headline>
+- [`<slug>`](../topics/<slug>.md) — <headline>
+
+---
+
+## Active topics (details)
+
+### <Topic display name> (`<slug>`) <prefix with ⚡ if has-high-importance>
 _Channels: #<ch1>, #<ch2> | People: <name1>, <name2>_
 
 <2–4 sentence narrative summary. What happened today with this topic?
@@ -338,11 +360,9 @@ What decision was made or what is still open?>
 - "<quote1>" — <Sender>, <time IST>
 - "<quote2>" — <Sender>, <time IST>
 
-(Prefix any excerpt from an `importance: "high"` message with `⚡` so it stands
-out. Topics where `has_high_importance: true` may also benefit from a `⚡` next
-to the topic title.)
+(Prefix any excerpt from an `importance: "high"` message with `⚡`.)
 
-[→ Topic details](~/.flow/playbooks/teams-morning-digest/topics/<slug>.md)
+[→ Full topic file](../topics/<slug>.md)
 
 ---
 
