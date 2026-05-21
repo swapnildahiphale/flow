@@ -130,9 +130,21 @@ For each channel group, identify obvious noise messages before LLM classificatio
 - Emoji-only messages (no text content)
 - Calendar invites, meeting reminders, auto-replies
 - Reaction-only events (if the API surfaces them)
+- **Routine operational chatter without an associated issue or decision** —
+  e.g. "please deploy build X", "deployed", "CRR-XXXXX filed for tomorrow",
+  "PR merged", scheduled handoffs, simple acknowledgements. These are operational
+  cadence, not topic-worthy on their own.
 
 Bucket these as `noise`. Do **not** topic-classify them. What remains is the
 "substantive" message list for each channel.
+
+**Why the routine-ops carve-out:** the digest is for *situational awareness*
+about issues, decisions, and where conversations are heading — not an audit log
+of every deploy. Routine "X did Y on schedule" chatter clutters the digest
+without telling the reader anything they need to act on. If a deploy goes
+wrong, that's an issue → classified normally under whatever topic captures the
+problem (e.g. `hix-deploy-eks-jenkins`). The bar for a topic is *something
+non-trivial is in flight or unresolved*.
 
 Keep a per-channel noise count for the digest noise-summary section.
 
@@ -180,6 +192,26 @@ resolution prompt — never silently rewrite `summary:`.
   topics whose narrative has clearly moved off the original `summary:`)
 
 Mark messages as part of topic `noise` only if they do not fit any meaningful topic.
+
+**Bar for creating a topic:**
+
+A topic exists when there is an **issue, decision, or unresolved question**
+worth tracking. Strong signals:
+- A bug, incident, or failure that is being investigated.
+- A discussion that produced (or is converging on) a decision.
+- An open question someone is waiting on.
+- A change that has cross-team implications still being worked through.
+
+Weak signals (do NOT create a topic for these alone):
+- "Please deploy X" / "Deployed X" / "CRR-XXXX filed" — operational cadence.
+- "PR raised / merged / approved" without context about *why* it matters.
+- One-off questions with a one-line answer and no follow-up.
+- Routine status updates ("AFK for 20 min", "OOO tomorrow").
+
+If a channel's substantive messages are all routine ops with no issue
+underneath, classify the channel itself as `noise` for this run — do NOT
+create a topic just because a channel was active. A one-line mention in the
+digest's noise summary is the right level of surface.
 
 **New topic slug rules:**
 - Lowercase, kebab-case, 2–4 words.
