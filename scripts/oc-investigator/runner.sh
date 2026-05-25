@@ -187,7 +187,86 @@ if (( ${#NEW_KEYS[@]} == 0 )); then
   exit 0
 fi
 
-# Task 8: create task + render brief + flow do
-# Task 9: logging hooks
+# --- process each new ticket --------------------------------------------
+JIRA_BASE_URL="https://jira.getinsured.com"  # used only to compose ticket URL
+TEMPLATE="${SCRIPT_DIR}/brief-template.md"
+RENDERER="${SCRIPT_DIR}/render_brief.py"
+
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+
+  # Split TSV: KEY  SUMMARY  REPORTER  PRIORITY  COMPONENTS  CREATED  DESCRIPTION
+  KEY=$(printf "%s" "$line" | cut -f1)
+  SUMMARY=$(printf "%s" "$line" | cut -f2)
+  REPORTER=$(printf "%s" "$line" | cut -f3)
+  PRIORITY=$(printf "%s" "$line" | cut -f4)
+  COMPONENTS=$(printf "%s" "$line" | cut -f5)
+  CREATED=$(printf "%s" "$line" | cut -f6)
+  DESC_ESC=$(printf "%s" "$line" | cut -f7)
+  DESCRIPTION=$(printf "%b" "${DESC_ESC//\\n/$'\n'}")  # un-escape \n
+  SLUG="${KEY:l}"
+  URL="${JIRA_BASE_URL}/browse/${KEY}"
+
+  if (( DRY_RUN )); then
+    log "[dry-run] would create task ${SLUG}, render brief, run flow do ${SLUG}"
+    continue
+  fi
+
+  # Create flow task. Truncate summary at 100 chars for the task name.
+  SHORT_SUMMARY="${SUMMARY:0:100}"
+  if ! flow add task "[${KEY}] ${SHORT_SUMMARY}" \
+        --slug "$SLUG" \
+        --project "$FLOW_PROJECT_SLUG" \
+        --work-dir "$FLOW_TASK_WORK_DIR" \
+        >/dev/null 2>>"$ERR_FILE"; then
+    logerr "flow add task failed for ${KEY}; skipping"
+    continue
+  fi
+  log "created flow task ${SLUG}"
+
+  # Tag the task #oncall so it surfaces in tag listings.
+  flow update task "$SLUG" --tag oncall >/dev/null 2>&1 || true
+
+  # Render the brief.
+  BRIEF_PATH="${HOME}/.flow/tasks/${SLUG}/brief.md"
+  VARS_JSON=$(python3 - "$KEY" "$SLUG" "$URL" "$SUMMARY" "$DESCRIPTION" \
+                          "$REPORTER" "$PRIORITY" "$COMPONENTS" "$CREATED" \
+                          "$INVESTIGATION_PRIOR_TICKETS_LIMIT" <<'PY'
+import json, sys
+from render_brief import truncate_description  # noqa: E402
+
+(key, slug, url, summary, desc, reporter, priority, comps, created, limit) = sys.argv[1:11]
+print(json.dumps({
+    "TICKET_KEY": key,
+    "TICKET_KEY_LC": slug,
+    "TICKET_URL": url,
+    "TICKET_SUMMARY": summary,
+    "TICKET_DESCRIPTION": truncate_description(desc, url),
+    "REPORTER": reporter,
+    "PRIORITY": priority,
+    "COMPONENTS": comps,
+    "CREATED": created,
+    "PRIOR_TICKETS_LIMIT": limit,
+}))
+PY
+)
+
+  # render_brief is in SCRIPT_DIR; cd there so the import works.
+  ( cd "$SCRIPT_DIR" && python3 render_brief.py \
+       --template "$TEMPLATE" \
+       --vars "$VARS_JSON" \
+  ) > "$BRIEF_PATH" 2>>"$ERR_FILE" || {
+    logerr "brief render failed for ${KEY}; flow task created but brief is stub"
+    continue
+  }
+  log "rendered brief at ${BRIEF_PATH}"
+
+  # Spawn the Claude session in a new tab.
+  if ! flow do "$SLUG" >/dev/null 2>>"$ERR_FILE"; then
+    logerr "flow do ${SLUG} failed; user can open the task manually later"
+    continue
+  fi
+  log "spawned session for ${SLUG}"
+done <<< "$NEW_TSV"
 
 log "=== runner end ==="
