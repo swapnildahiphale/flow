@@ -169,12 +169,24 @@ done <<< "$TICKETS_TSV"
 
 log "${#NEW_KEYS[@]} new ticket(s) to process"
 
+# --- ensure 'oncall' project exists once per sweep -----------------------
+if ! flow show project "$FLOW_PROJECT_SLUG" >/dev/null 2>&1; then
+  if (( DRY_RUN )); then
+    log "[dry-run] would create flow project '${FLOW_PROJECT_SLUG}'"
+  else
+    if ! flow add project "On-call" --slug "$FLOW_PROJECT_SLUG" --work-dir "$FLOW_TASK_WORK_DIR" >/dev/null 2>>"$ERR_FILE"; then
+      logerr "failed to create flow project ${FLOW_PROJECT_SLUG}"
+      exit 0
+    fi
+    log "created flow project ${FLOW_PROJECT_SLUG}"
+  fi
+fi
+
 if (( ${#NEW_KEYS[@]} == 0 )); then
   log "=== runner end (nothing to do) ==="
   exit 0
 fi
 
-# Task 7: ensure project
 # Task 8: create task + render brief + flow do
 # Task 9: logging hooks
 
