@@ -92,8 +92,6 @@ done
 
 log "config loaded: project=${JIRA_PROJECT_KEY} assignee=${JIRA_ASSIGNEE_EMAIL} window=${JIRA_WINDOW_HOURS}h"
 
-# --- TODO: subsequent tasks fill in --------------------------------------
-
 # --- JQL composition -----------------------------------------------------
 if [[ "$JIRA_ASSIGNEE_EMAIL" == "*" ]]; then
   JQL="project = ${JIRA_PROJECT_KEY} AND created >= -${JIRA_WINDOW_HOURS}h ORDER BY created ASC"
