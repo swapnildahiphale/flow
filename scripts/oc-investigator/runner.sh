@@ -147,7 +147,33 @@ PY
 TICKET_COUNT=$(printf "%s" "$TICKETS_TSV" | grep -c . || true)
 log "Jira returned ${TICKET_COUNT} ticket(s)"
 
-# Task 6: dedup
+# --- per-ticket iteration ------------------------------------------------
+# Loop over the TSV; produce a list of NEW tickets to process.
+NEW_KEYS=()
+NEW_TSV=""
+
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  KEY="${line%%$'\t'*}"
+  SLUG="${KEY:l}"   # lowercase
+
+  if flow show task "$SLUG" >/dev/null 2>&1; then
+    log "skip ${KEY} — flow task ${SLUG} already exists"
+    continue
+  fi
+
+  log "new ticket: ${KEY} (slug ${SLUG})"
+  NEW_KEYS+=("$KEY")
+  NEW_TSV+="${line}"$'\n'
+done <<< "$TICKETS_TSV"
+
+log "${#NEW_KEYS[@]} new ticket(s) to process"
+
+if (( ${#NEW_KEYS[@]} == 0 )); then
+  log "=== runner end (nothing to do) ==="
+  exit 0
+fi
+
 # Task 7: ensure project
 # Task 8: create task + render brief + flow do
 # Task 9: logging hooks
