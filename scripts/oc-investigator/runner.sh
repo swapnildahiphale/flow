@@ -93,7 +93,60 @@ done
 log "config loaded: project=${JIRA_PROJECT_KEY} assignee=${JIRA_ASSIGNEE_EMAIL} window=${JIRA_WINDOW_HOURS}h"
 
 # --- TODO: subsequent tasks fill in --------------------------------------
-# Task 5: JQL composition + Jira invocation
+
+# --- JQL composition -----------------------------------------------------
+if [[ "$JIRA_ASSIGNEE_EMAIL" == "*" ]]; then
+  JQL="project = ${JIRA_PROJECT_KEY} AND created >= -${JIRA_WINDOW_HOURS}h ORDER BY created ASC"
+else
+  JQL="project = ${JIRA_PROJECT_KEY} AND assignee = \"${JIRA_ASSIGNEE_EMAIL}\" AND created >= -${JIRA_WINDOW_HOURS}h ORDER BY created ASC"
+fi
+log "JQL: ${JQL}"
+
+# --- Jira search ---------------------------------------------------------
+SEARCH_SCRIPT="${JIRA_SKILL_SCRIPTS_DIR}/search_issues.py"
+if [[ ! -x "$SEARCH_SCRIPT" && ! -f "$SEARCH_SCRIPT" ]]; then
+  logerr "Jira skill search script not found at: $SEARCH_SCRIPT"
+  exit 0
+fi
+
+if (( DRY_RUN )); then
+  log "[dry-run] would run: python3 $SEARCH_SCRIPT --jql '<...>' --fields summary,description,assignee,reporter,priority,components,created"
+fi
+
+# Always do the read — JQL search is side-effect-free, and we need ticket
+# data even in dry-run mode to log what would be processed.
+SEARCH_OUT=$(python3 "$SEARCH_SCRIPT" \
+  --jql "$JQL" \
+  --fields "summary,description,assignee,reporter,priority,components,created" \
+  2>>"$ERR_FILE") || {
+  logerr "Jira search failed (rc=$?) — see err.log; will retry next poll"
+  exit 0
+}
+
+# Extract ticket keys + key fields via Python (jq is not guaranteed
+# installed). Pipes the Jira JSON in on stdin, emits one ticket per
+# line as TAB-separated:
+#   KEY \t SUMMARY \t REPORTER \t PRIORITY \t COMPONENTS \t CREATED \t DESCRIPTION
+TICKETS_TSV=$(printf "%s" "$SEARCH_OUT" | python3 - <<'PY'
+import json, sys
+data = json.load(sys.stdin)
+issues = data.get("issues", []) if isinstance(data, dict) else data
+for issue in issues:
+    key = issue.get("key", "")
+    f = issue.get("fields", {}) or {}
+    summary = (f.get("summary") or "").replace("\t", " ").replace("\n", " ")
+    reporter = ((f.get("reporter") or {}).get("displayName") or "").replace("\t", " ")
+    priority = ((f.get("priority") or {}).get("name") or "").replace("\t", " ")
+    comps = ",".join(c.get("name","") for c in (f.get("components") or []))
+    created = (f.get("created") or "")
+    desc = (f.get("description") or "").replace("\t", " ").replace("\n", "\\n")
+    print("\t".join([key, summary, reporter, priority, comps, created, desc]))
+PY
+)
+
+TICKET_COUNT=$(printf "%s" "$TICKETS_TSV" | grep -c . || true)
+log "Jira returned ${TICKET_COUNT} ticket(s)"
+
 # Task 6: dedup
 # Task 7: ensure project
 # Task 8: create task + render brief + flow do
