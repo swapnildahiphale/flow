@@ -83,7 +83,8 @@ eval "$config_vars"
 
 # Validate required keys
 for key in JIRA_PROJECT_KEY JIRA_ASSIGNEE_EMAIL JIRA_WINDOW_HOURS \
-           JIRA_SKILL_SCRIPTS_DIR FLOW_PROJECT_SLUG FLOW_TASK_WORK_DIR; do
+           JIRA_SKILL_SCRIPTS_DIR FLOW_PROJECT_SLUG FLOW_TASK_WORK_DIR \
+           INVESTIGATION_PRIOR_TICKETS_LIMIT; do
   if [[ -z "${(P)key:-}" ]]; then
     logerr "missing required config key: $key"
     exit 0
@@ -140,7 +141,7 @@ for issue in issues:
     desc = (f.get("description") or "").replace("\t", " ").replace("\n", "\\n")
     print("\t".join([key, summary, reporter, priority, comps, created, desc]))
 PY
-)
+) || { logerr "TSV extract failed — Jira returned non-JSON?"; exit 0; }
 
 TICKET_COUNT=$(printf "%s" "$TICKETS_TSV" | grep -c . || true)
 log "Jira returned ${TICKET_COUNT} ticket(s)"
@@ -188,7 +189,6 @@ fi
 # --- process each new ticket --------------------------------------------
 JIRA_BASE_URL="https://jira.getinsured.com"  # used only to compose ticket URL
 TEMPLATE="${SCRIPT_DIR}/brief-template.md"
-RENDERER="${SCRIPT_DIR}/render_brief.py"
 
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
@@ -201,7 +201,7 @@ while IFS= read -r line; do
   COMPONENTS=$(printf "%s" "$line" | cut -f5)
   CREATED=$(printf "%s" "$line" | cut -f6)
   DESC_ESC=$(printf "%s" "$line" | cut -f7)
-  DESCRIPTION=$(printf "%b" "${DESC_ESC//\\n/$'\n'}")  # un-escape \n
+  _NL=$'\n'; DESCRIPTION="${DESC_ESC//\\n/${_NL}}"  # un-escape \n (printf %b corrupts \\ \t etc)
   SLUG="${KEY:l}"
   URL="${JIRA_BASE_URL}/browse/${KEY}"
 
@@ -227,7 +227,7 @@ while IFS= read -r line; do
 
   # Render the brief.
   BRIEF_PATH="${HOME}/.flow/tasks/${SLUG}/brief.md"
-  VARS_JSON=$(python3 - "$KEY" "$SLUG" "$URL" "$SUMMARY" "$DESCRIPTION" \
+  VARS_JSON=$( cd "$SCRIPT_DIR" && python3 - "$KEY" "$SLUG" "$URL" "$SUMMARY" "$DESCRIPTION" \
                           "$REPORTER" "$PRIORITY" "$COMPONENTS" "$CREATED" \
                           "$INVESTIGATION_PRIOR_TICKETS_LIMIT" <<'PY'
 import json, sys
