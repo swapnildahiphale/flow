@@ -1,0 +1,32 @@
+# OC Investigator — config
+# Copy to ~/.flow/oc-investigator/config.yaml (install.sh does this).
+
+jira:
+  project_key: OC
+  # Filter: investigate tickets assigned to this email.
+  # Set to "*" to fire for every new OC ticket regardless of assignee.
+  assignee_email: swapnil.dahiphale@getinsured.com
+  # JQL look-back window in hours. Wider = more robust against missed polls.
+  window_hours: 2
+  # Path to the Jira skill's CLI scripts dir. Runner uses these for JQL
+  # search from shell. Inside the spawned Claude session the skill is
+  # loaded automatically — script paths are not needed there.
+  skill_scripts_dir: /Users/swapnil/workspace/vimo/engineering-knowledge-base/skills/jira/scripts
+
+flow:
+  # Project the OC tasks land under. Auto-created on first run if missing.
+  project_slug: oncall
+  # work_dir for each created task. Must be an existing dir on disk.
+  task_work_dir: /Users/swapnil/workspace/vimo/agent-workspace
+
+investigation:
+  enable_prior_tickets: true
+  enable_repo_context: true
+  enable_k8s_context: true
+  prior_tickets_limit: 5
+
+output:
+  # Set false to suppress the Jira comment (useful while testing).
+  jira_comment: true
+  # Set false to skip writing the detailed flow update.
+  flow_update: true
