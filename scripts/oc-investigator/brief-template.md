@@ -56,9 +56,27 @@ PHASE 6 (parallel outputs):
   • If output.jira_comment=true: post a concise comment on $TICKET_KEY
     (<300 words) — symptom → root cause → resolution. ASCII diagram if
     it clarifies.
+    Jira-comment hygiene (strict — these rules are non-negotiable):
+      - NEVER use the word "flow" in the comment. Not "flow task",
+        not "flow update", not "flow session", not "see flow" — the
+        tool that produced this investigation is invisible to Jira
+        readers and must stay invisible.
+      - NEVER reference any local-only paths: no `~/.flow/...`, no
+        `/Users/...`, no "more details at <local path>", no laptop
+        file or directory names. Jira readers don't have your
+        filesystem.
+      - NEVER mention the spawned session, the runner, the
+        LaunchAgent, automation, or that this comment was
+        auto-generated. The comment must read as a standalone
+        investigation summary authored by the on-call engineer.
+      - Cite shared-system evidence only: Jira keys, Confluence pages,
+        Bitbucket commits/PRs, Argo CD URLs, kubectl resource names,
+        Grafana dashboard links, log timestamps. Anything a teammate
+        could open from their own machine.
   • If output.flow_update=true: save a flow update at
     `~/.flow/tasks/$TICKET_KEY_LC/updates/YYYY-MM-DD-investigation.md`
     with full detail, alternatives considered, code/log excerpts.
+    (This file IS local-only — full detail lives here, not in Jira.)
 
 STOP. No auto-remediation, no ticket transitions, no pages.
 
