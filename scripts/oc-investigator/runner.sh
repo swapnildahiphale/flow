@@ -20,16 +20,26 @@ ERR_FILE="${LOG_DIR}/err.log"
 # teams-morning-digest PATH fix.
 export PATH="/usr/local/bin:/opt/homebrew/bin:${PATH}"
 
+# jira_common.py defaults to a Mozilla/Chrome User-Agent which trips Jira
+# Data Center's XSRF policy on POST /rest/api/2/search (HTTP 403 XSRF check
+# failed). Override with a non-browser UA so Bearer-auth requests skip
+# the XSRF gate.
+export JIRA_USER_AGENT="${JIRA_USER_AGENT:-flow-oc-investigator/1.0 (+swapnil.dahiphale)}"
+
 # --- flags ---------------------------------------------------------------
 DRY_RUN=0
-for arg in "$@"; do
-  case "$arg" in
+LIMIT=0   # 0 = no limit
+while (( $# > 0 )); do
+  case "$1" in
     --dry-run) DRY_RUN=1 ;;
+    --limit)   shift; LIMIT="$1" ;;
+    --limit=*) LIMIT="${1#--limit=}" ;;
     --help|-h)
-      echo "Usage: runner.sh [--dry-run]"
+      echo "Usage: runner.sh [--dry-run] [--limit N]"
       exit 0
       ;;
   esac
+  shift
 done
 
 # --- logging -------------------------------------------------------------
@@ -123,12 +133,13 @@ SEARCH_OUT=$(python3 "$SEARCH_SCRIPT" \
 }
 
 # Extract ticket keys + key fields via Python (jq is not guaranteed
-# installed). Pipes the Jira JSON in on stdin, emits one ticket per
-# line as TAB-separated:
+# installed). Passes the Jira JSON via env var (zsh treats heredoc +
+# stdin-pipe as concatenated python source, so a pipe doesn't work here).
+# Emits one ticket per line as TAB-separated:
 #   KEY \t SUMMARY \t REPORTER \t PRIORITY \t COMPONENTS \t CREATED \t DESCRIPTION
-TICKETS_TSV=$(printf "%s" "$SEARCH_OUT" | python3 - <<'PY'
-import json, sys
-data = json.load(sys.stdin)
+TICKETS_TSV=$(_OCI_SEARCH_JSON="$SEARCH_OUT" python3 - <<'PY'
+import json, os, sys
+data = json.loads(os.environ["_OCI_SEARCH_JSON"])
 issues = data.get("issues", []) if isinstance(data, dict) else data
 for issue in issues:
     key = issue.get("key", "")
@@ -164,6 +175,11 @@ while IFS= read -r line; do
   log "new ticket: ${KEY} (slug ${SLUG})"
   NEW_KEYS+=("$KEY")
   NEW_TSV+="${line}"$'\n'
+
+  if (( LIMIT > 0 )) && (( ${#NEW_KEYS[@]} >= LIMIT )); then
+    log "reached --limit ${LIMIT}; deferring remaining tickets to next poll"
+    break
+  fi
 done <<< "$TICKETS_TSV"
 
 log "${#NEW_KEYS[@]} new ticket(s) to process"
