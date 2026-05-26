@@ -12,6 +12,18 @@
         <string>$HOME/.flow/scripts/teams-morning-digest-runner.sh</string>
     </array>
 
+    <!-- Force Warp backend regardless of which terminals are running at fire
+         time. The default spawner (iTerm) fails with osascript -2741 when
+         iTerm isn't already running, because `tell current window` can't
+         resolve before iTerm has had time to open a window. Warp's backend
+         probes is-running, activates, and waits before keystroking — so it
+         handles cold-start cleanly. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FLOW_TERM</key>
+        <string>warp</string>
+    </dict>
+
     <!-- Fire at 08:00 local time, Monday through Friday.
          macOS launchd coalesces missed StartCalendarInterval events into one
          fire when the laptop wakes, so a closed laptop at 08:00 will catch up

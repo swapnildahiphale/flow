@@ -45,8 +45,11 @@ if [ -f "$DIGEST_FILE" ]; then
   exit 0
 fi
 
-# Ensure flow CLI is reachable when spawned from launchd (limited PATH)
-export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/go/bin:$PATH"
+# Ensure flow CLI is reachable when spawned from launchd (limited PATH).
+# $HOME/.local/bin first — that's where `make install` writes the up-to-date
+# binary. /opt/homebrew/bin may hold an older copy from a prior install, and
+# we don't want launchd to find that one (it predates FLOW_TERM support).
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$HOME/go/bin:$PATH"
 
 if ! command -v flow >/dev/null 2>&1; then
   log "ERROR: flow not on PATH after augmentation (PATH=$PATH)"
