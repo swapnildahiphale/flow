@@ -419,7 +419,8 @@ work_dir: <path>
 - <question 1>
 
 ---
-*Before you start on this task, read CLAUDE.md in the work_dir.*
+*Before you start on this task, read repo instruction files in the
+work_dir (`AGENTS.md`, `CLAUDE.md`, or equivalent) if present.*
 ```
 
 **Tag step — always ask, easy to skip.** Right after the brief
@@ -772,7 +773,7 @@ it".
 
 **Why closing matters — read this before treating `flow done` as
 bookkeeping.** `flow done` is not just a status flip. It runs a
-headless Claude sweep over the task's transcript that distills
+headless selected-harness sweep over the task's transcript that distills
 durable facts into the user's KB (`~/.flow/kb/`) and, when the task
 has a project, writes a project update at
 `~/.flow/projects/<slug>/updates/` summarizing what got done and
@@ -1716,10 +1717,10 @@ work_dir: <absolute path>
 - <question 2>
 
 ---
-*Before you start on this task, read CLAUDE.md in the work_dir and any
-nested CLAUDE.md files in the subtree you plan to modify. Then read
-every file under `updates/` (if any exist) to catch up on prior
-progress.*
+*Before you start on this task, read repo instruction files in the
+work_dir (`AGENTS.md`, `CLAUDE.md`, or equivalent) and any nested
+instruction files in the subtree you plan to modify. Then read every
+file under `updates/` (if any exist) to catch up on prior progress.*
 ```
 
 **Thin task brief (intake-minimal):**
@@ -1965,8 +1966,9 @@ proposing any plan:
 
    Again, skip the project's `kb:` section at bootstrap.
 
-4. **Load repo conventions.** Read `CLAUDE.md` in your `work_dir` (if
-   present), plus any nested `CLAUDE.md` files under subdirectories
+4. **Load repo conventions.** Read repo instruction files in your
+   `work_dir` (for example, `AGENTS.md`, `CLAUDE.md`, or equivalent)
+   if present, plus any nested instruction files under subdirectories
    you plan to modify. These are authoritative for build commands,
    test commands, style, and gotchas — they override any assumption
    you might make from the brief.
