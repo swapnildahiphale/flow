@@ -106,10 +106,10 @@ func ambientHarness() harness.Harness {
 //     adopts codex.
 //  3. Otherwise, default to claude.
 //
-// flow's caller persists the result onto task.harness atomically
-// with the session_id write (guarded by a COALESCE clause so an
-// existing pin isn't overwritten), so step 1 dominates on every
-// subsequent invocation.
+// flow's caller persists the result onto task.harness atomically with
+// each fresh session bind. Existing harness pins are resolved through
+// step 1 before that write, so subsequent invocations keep using the
+// pinned adapter unless an explicit rebinding path changes it.
 func harnessForSpawn(task *flowdb.Task) (harness.Harness, error) {
 	if task != nil && task.Harness.Valid && task.Harness.String != "" {
 		return harnessByName(task.Harness.String)

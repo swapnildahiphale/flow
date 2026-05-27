@@ -185,6 +185,13 @@ func cmdDo(args []string) int {
 	}
 	sessionCtx := harness.SessionContext{WorkDir: task.WorkDir, Env: os.Environ()}
 
+	if task.Status == "done" && injectionText == "" {
+		fmt.Fprintf(os.Stderr,
+			"error: task %q is done; edit its status back to backlog or in-progress to reopen it\n",
+			task.Slug)
+		return 1
+	}
+
 	if !*force && task.SessionID.Valid && task.SessionID.String != "" {
 		if live, err := h.LiveSessionIDs(); err == nil {
 			if n := live[strings.ToLower(task.SessionID.String)]; n > 0 {
@@ -282,6 +289,7 @@ func cmdDo(args []string) int {
 	}
 
 	now := flowdb.NowISO()
+	sessionStarted := now
 	// 'done' is reachable here only via the --with auto-reopen path above.
 	const statusFilter = "status IN ('backlog','in-progress','done')"
 	if needsBootstrap {
@@ -313,9 +321,10 @@ func cmdDo(args []string) int {
 			 updated_at=?
 			 WHERE slug=?
 			   AND `+statusFilter+`
+			   AND updated_at=?
 			   AND ((? = '' AND session_id IS NULL) OR session_id = ?)`,
 			now, sessionID, now, string(h.Name()), now, task.Slug,
-			expectedSessionID, expectedSessionID,
+			task.UpdatedAt, expectedSessionID, expectedSessionID,
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: flip status: %v\n", err)
@@ -375,7 +384,7 @@ func cmdDo(args []string) int {
 	var command string
 	if needsBootstrap {
 		if err := h.BootstrapFreshSession(sessionCtx, sessionID, prompt, launchOpts); err != nil {
-			rollbackFreshSessionBind(db, task.Slug, sessionID)
+			rollbackFreshSessionBind(db, task.Slug, sessionID, sessionStarted)
 			fmt.Fprintf(os.Stderr, "error: bootstrap session: %v\n", err)
 			return 1
 		}
@@ -407,7 +416,7 @@ func cmdDo(args []string) int {
 			// The WHERE clause guards against a concurrent `flow do`
 			// having mutated session_id between commit and now —
 			// only roll back if we still own the session.
-			rollbackFreshSessionBind(db, task.Slug, sessionID)
+			rollbackFreshSessionBind(db, task.Slug, sessionID, sessionStarted)
 		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -439,18 +448,28 @@ func cmdDo(args []string) int {
 	return 0
 }
 
-func rollbackFreshSessionBind(db *sql.DB, slug, sessionID string) {
-	if _, err := db.Exec(
+func rollbackFreshSessionBind(db *sql.DB, slug, sessionID, sessionStarted string) {
+	res, err := db.Exec(
 		`UPDATE tasks SET
 			session_id        = NULL,
 			session_started   = NULL,
 			status            = 'backlog',
 			status_changed_at = NULL,
 			updated_at        = ?
-		 WHERE slug=? AND session_id=?`,
-		flowdb.NowISO(), slug, sessionID,
-	); err != nil {
+		 WHERE slug=?
+		   AND session_id=?
+		   AND status='in-progress'
+		   AND session_started=?`,
+		flowdb.NowISO(), slug, sessionID, sessionStarted,
+	)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: rollback fresh session bind: %v\n", err)
+		return
+	}
+	if affected, err := res.RowsAffected(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: rollback fresh session bind: rows affected: %v\n", err)
+	} else if affected == 0 {
+		fmt.Fprintf(os.Stderr, "warning: rollback fresh session bind: no matching in-progress bind for task %q session %s\n", slug, sessionID)
 	}
 }
 

@@ -392,6 +392,124 @@ func TestCmdDoFreshSpawnFailureRollsBackSessionID(t *testing.T) {
 	}
 }
 
+func TestCmdDoFreshDoneTaskRefusesBeforePrepare(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "done-fresh")
+
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET status='done', session_id=?, session_started=?, updated_at=? WHERE slug='done-fresh'`,
+		fakeSessionID("done-fresh"), flowdb.NowISO(), flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	var uuidCalls int64
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) {
+		atomic.AddInt64(&uuidCalls, 1)
+		return "11111111-2222-4333-8444-555555555555", nil
+	}
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	spawns, _ := stubITerm(t)
+	if rc := cmdDo([]string{"done-fresh", "--fresh"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(&uuidCalls); got != 0 {
+		t.Fatalf("PrepareFreshSession/NewUUID calls=%d, want 0", got)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+}
+
+func TestCmdDoFreshDetectsTaskChangedDuringPrepare(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "stale-during-prepare")
+	spawns, _ := stubITerm(t)
+
+	newWorkDir := t.TempDir()
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) {
+		db := openFlowDB(t)
+		defer db.Close()
+		_, err := db.Exec(
+			`UPDATE tasks SET work_dir=?, updated_at=? WHERE slug='stale-during-prepare'`,
+			newWorkDir, "2099-01-01T00:00:00Z",
+		)
+		return "22222222-3333-4444-8555-666666666666", err
+	}
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	if rc := cmdDo([]string{"stale-during-prepare"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+
+	db := openFlowDB(t)
+	defer db.Close()
+	task, err := flowdb.GetTask(db, "stale-during-prepare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.SessionID.Valid {
+		t.Fatalf("session_id=%q, want NULL", task.SessionID.String)
+	}
+	if task.WorkDir != newWorkDir {
+		t.Fatalf("work_dir=%q, want concurrent update %q preserved", task.WorkDir, newWorkDir)
+	}
+}
+
+func TestCmdDoFreshRollbackDoesNotClobberConcurrentStatusChange(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "rollback-race")
+
+	const pinnedSID = "33333333-4444-4555-8666-777777777777"
+	stubNewUUID(t, pinnedSID)
+
+	old := iterm.Runner
+	iterm.Runner = func(args []string) error {
+		db := openFlowDB(t)
+		defer db.Close()
+		if _, err := db.Exec(
+			`UPDATE tasks SET status='done', status_changed_at=?, updated_at=? WHERE slug='rollback-race'`,
+			flowdb.NowISO(), flowdb.NowISO(),
+		); err != nil {
+			t.Fatalf("concurrent status update: %v", err)
+		}
+		return errors.New("simulated spawn failure after concurrent status change")
+	}
+	t.Cleanup(func() { iterm.Runner = old })
+
+	oldOverride := spawner.Override
+	spawner.Override = spawner.BackendITerm
+	t.Cleanup(func() { spawner.Override = oldOverride })
+
+	if rc := cmdDo([]string{"rollback-race"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+
+	db := openFlowDB(t)
+	defer db.Close()
+	task, err := flowdb.GetTask(db, "rollback-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "done" {
+		t.Fatalf("status=%q, want done", task.Status)
+	}
+	if !task.SessionID.Valid || task.SessionID.String != pinnedSID {
+		t.Fatalf("session_id=%+v, want %s", task.SessionID, pinnedSID)
+	}
+	if !task.SessionStarted.Valid {
+		t.Fatal("session_started should remain set")
+	}
+}
+
 // TestCmdDoResumeSpawnFailureKeepsSessionID is the inverse of the
 // fresh-bootstrap case: when a RESUME spawn fails (the session_id
 // already pointed at a real jsonl from a previous successful spawn),
