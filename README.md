@@ -263,8 +263,9 @@ hook, so back up those real Codex integration files first:
 
 ```bash
 ts=$(date +%Y%m%d%H%M%S)
+codex_home="${CODEX_HOME:-$HOME/.codex}"
 [ ! -e ~/.agents/skills/flow ] || cp -a ~/.agents/skills/flow ~/.agents/skills/flow.backup.$ts
-[ ! -e ~/.codex/hooks.json ] || cp -a ~/.codex/hooks.json ~/.codex/hooks.json.backup.$ts
+[ ! -e "$codex_home/hooks.json" ] || cp -a "$codex_home/hooks.json" "$codex_home/hooks.json.backup.$ts"
 ```
 
 Then smoke the Codex path under the temp `FLOW_ROOT`. After the
