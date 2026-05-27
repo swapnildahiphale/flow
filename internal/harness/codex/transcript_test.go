@@ -43,6 +43,32 @@ func TestRenderTranscriptCompactOmitsToolOutput(t *testing.T) {
 	}
 }
 
+func TestRenderTranscriptRealCodexPayloadShapes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	raw := `{"type":"session_meta","payload":{"id":"` + testThreadID + `"},"timestamp":"2026-05-28T10:00:00Z"}
+{"type":"event_msg","payload":{"type":"user_message","message":"real user request"},"timestamp":"2026-05-28T10:00:01Z"}
+{"type":"event_msg","payload":{"type":"agent_message","message":"duplicate assistant event"},"timestamp":"2026-05-28T10:00:02Z"}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"real assistant reply"}]},"timestamp":"2026-05-28T10:00:03Z"}
+{"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"cmd\":\"flow show task\"}"},"timestamp":"2026-05-28T10:00:04Z"}
+{"type":"response_item","payload":{"type":"function_call_output","output":"real tool output"},"timestamp":"2026-05-28T10:00:05Z"}
+`
+	writeCodexRollout(t, home, "sessions/rollout-"+testThreadID+".jsonl", raw, time.Now())
+
+	var out strings.Builder
+	if err := New().RenderTranscript("/unused", testThreadID, false, time.Time{}, &out); err != nil {
+		t.Fatalf("RenderTranscript: %v", err)
+	}
+	for _, want := range []string{"real user request", "real assistant reply", "$ flow show task", "real tool output"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output missing %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "duplicate assistant event") {
+		t.Fatalf("agent_message duplicate should be skipped:\n%s", out.String())
+	}
+}
+
 func TestFindRolloutChoosesNewestVerifiedRollout(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", home)
@@ -81,6 +107,27 @@ func TestFindRolloutChoosesNewestVerifiedRollout(t *testing.T) {
 	}
 	if got != newer {
 		t.Fatalf("findRollout=%q, want newest verified %q (older %q)", got, newer, older)
+	}
+}
+
+func TestFindRolloutMatchesSessionIDCaseInsensitively(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	writeCodexRollout(
+		t,
+		home,
+		"sessions/rollout-"+strings.ToLower(testThreadID)+".jsonl",
+		`{"type":"session_meta","payload":{"id":"`+strings.ToLower(testThreadID)+`"}}`+"\n"+
+			`{"type":"event_msg","payload":{"type":"user_message","message":"case matched"}}`+"\n",
+		time.Now(),
+	)
+
+	var out strings.Builder
+	if err := New().RenderTranscript("/unused", strings.ToUpper(testThreadID), false, time.Time{}, &out); err != nil {
+		t.Fatalf("RenderTranscript uppercase session id: %v", err)
+	}
+	if !strings.Contains(out.String(), "case matched") {
+		t.Fatalf("output missing case-insensitive rollout content:\n%s", out.String())
 	}
 }
 

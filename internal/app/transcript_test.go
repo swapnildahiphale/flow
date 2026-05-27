@@ -100,8 +100,8 @@ func TestTranscriptNoRefCodexAmbient(t *testing.T) {
 	}
 	t.Setenv("CODEX_THREAD_ID", sid)
 	writeAppCodexRollout(t, codexHome, sid, `{"type":"session_meta","payload":{"id":"`+sid+`"},"timestamp":"2026-05-28T10:00:00Z"}
-{"type":"event_msg","payload":{"role":"user","content":"ambient user text"},"timestamp":"2026-05-28T10:00:01Z"}
-{"type":"event_msg","payload":{"role":"assistant","content":"ambient assistant text"},"timestamp":"2026-05-28T10:00:02Z"}
+{"type":"event_msg","payload":{"type":"user_message","message":"ambient user text"},"timestamp":"2026-05-28T10:00:01Z"}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ambient assistant text"}]},"timestamp":"2026-05-28T10:00:02Z"}
 `)
 
 	var rc int

@@ -35,23 +35,31 @@ func findRollout(sessionID string) (string, error) {
 		return "", err
 	}
 	root := filepath.Join(home, "sessions")
+	sessionIDLower := strings.ToLower(sessionID)
 
 	var newest string
 	var newestMod time.Time
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil || d == nil || d.IsDir() {
+			if walkErr != nil && rolloutNameMatchesSession(filepath.Base(path), sessionIDLower) {
+				return fmt.Errorf("access codex rollout candidate %s: %w", path, walkErr)
+			}
 			return nil
 		}
 		name := d.Name()
-		if !strings.HasPrefix(name, "rollout-") || !strings.Contains(name, sessionID) || !strings.HasSuffix(name, ".jsonl") {
+		if !rolloutNameMatchesSession(name, sessionIDLower) {
 			return nil
 		}
-		if !rolloutHasSessionMeta(path, sessionID) {
+		matches, err := rolloutHasSessionMeta(path, sessionID)
+		if err != nil {
+			return err
+		}
+		if !matches {
 			return nil
 		}
 		info, err := d.Info()
 		if err != nil {
-			return nil
+			return fmt.Errorf("stat codex rollout %s: %w", path, err)
 		}
 		if newest == "" || info.ModTime().After(newestMod) {
 			newest = path
@@ -59,6 +67,9 @@ func findRollout(sessionID string) (string, error) {
 		}
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
 
 	if newest == "" {
 		return "", fmt.Errorf("codex rollout not found under %s for session %s", root, sessionID)
@@ -66,10 +77,15 @@ func findRollout(sessionID string) (string, error) {
 	return newest, nil
 }
 
-func rolloutHasSessionMeta(path, sessionID string) bool {
+func rolloutNameMatchesSession(name, sessionIDLower string) bool {
+	name = strings.ToLower(name)
+	return strings.HasPrefix(name, "rollout-") && strings.Contains(name, sessionIDLower) && strings.HasSuffix(name, ".jsonl")
+}
+
+func rolloutHasSessionMeta(path, sessionID string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return false, fmt.Errorf("open codex rollout candidate %s: %w", path, err)
 	}
 	defer f.Close()
 
@@ -85,11 +101,14 @@ func rolloutHasSessionMeta(path, sessionID string) bool {
 		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
 			continue
 		}
-		if rec.Type == "session_meta" && rec.Payload.ID == sessionID {
-			return true
+		if rec.Type == "session_meta" && strings.EqualFold(rec.Payload.ID, sessionID) {
+			return true, nil
 		}
 	}
-	return false
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("read codex rollout candidate %s: %w", path, err)
+	}
+	return false, nil
 }
 
 // RenderJSONL renders a Codex rollout jsonl byte-stream to w.
@@ -132,14 +151,18 @@ type codexRolloutRecord struct {
 }
 
 type codexEventPayload struct {
+	Type    string          `json:"type"`
 	Role    string          `json:"role"`
+	Message json.RawMessage `json:"message"`
 	Content json.RawMessage `json:"content"`
 	Item    json.RawMessage `json:"item"`
 }
 
 type codexResponseItem struct {
 	Type      string          `json:"type"`
+	Role      string          `json:"role"`
 	Name      string          `json:"name"`
+	Content   json.RawMessage `json:"content"`
 	Arguments json.RawMessage `json:"arguments"`
 	Output    json.RawMessage `json:"output"`
 }
@@ -154,6 +177,19 @@ func renderCodexRecord(w io.Writer, rec codexRolloutRecord, compact bool, first 
 	case "event_msg":
 		var payload codexEventPayload
 		if err := json.Unmarshal(rec.Payload, &payload); err != nil {
+			return false
+		}
+		if payload.Type == "user_message" {
+			text := extractCodexText(payload.Message)
+			if text == "" {
+				return false
+			}
+			printGap(w, first)
+			fmt.Fprintln(w, "─── User ───")
+			fmt.Fprintln(w, text)
+			return true
+		}
+		if payload.Type == "agent_message" {
 			return false
 		}
 		if payload.Role != "user" && payload.Role != "assistant" {
@@ -174,6 +210,19 @@ func renderCodexRecord(w io.Writer, rec codexRolloutRecord, compact bool, first 
 	case "response_item":
 		item := responseItem(rec)
 		switch item.Type {
+		case "message":
+			text := extractCodexText(item.Content)
+			if text == "" {
+				return false
+			}
+			printGap(w, first)
+			if item.Role == "user" {
+				fmt.Fprintln(w, "─── User ───")
+			} else {
+				fmt.Fprintln(w, "─── Assistant ───")
+			}
+			fmt.Fprintln(w, text)
+			return true
 		case "function_call":
 			printGap(w, first)
 			name := item.Name
@@ -205,6 +254,9 @@ func renderCodexRecord(w io.Writer, rec codexRolloutRecord, compact bool, first 
 func responseItem(rec codexRolloutRecord) codexResponseItem {
 	var item codexResponseItem
 	if len(rec.Item) > 0 && json.Unmarshal(rec.Item, &item) == nil && item.Type != "" {
+		return item
+	}
+	if len(rec.Payload) > 0 && json.Unmarshal(rec.Payload, &item) == nil && item.Type != "" {
 		return item
 	}
 	var payload codexEventPayload
