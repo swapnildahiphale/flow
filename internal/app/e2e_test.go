@@ -309,8 +309,9 @@ func TestE2ECodexHarnessRoundtrip(t *testing.T) {
 		t.Fatalf("spawn script missing codex resume: %s", script)
 	} else {
 		for key, value := range map[string]string{"FLOW_ROOT": flowRoot, "HOME": tmp, "CODEX_HOME": codexHome} {
-			if !strings.Contains(script, key+"=") || !strings.Contains(script, value) {
-				t.Fatalf("spawn script missing %s=%s propagation: %s", key, value, script)
+			needle := key + "='" + value + "'"
+			if !strings.Contains(script, needle) {
+				t.Fatalf("spawn script missing %s propagation: %s", needle, script)
 			}
 		}
 	}
