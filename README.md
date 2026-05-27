@@ -217,6 +217,67 @@ UserPromptSubmit hooks. Check the running version with
 Just open Claude and say **"let's get to work"**. The skill
 handles the rest.
 
+### Codex harness
+
+Claude remains the default harness for `flow do <task>`. To start a
+task in Codex instead, pass the harness explicitly:
+
+```bash
+flow do --harness codex <task-slug>
+flow do --here --harness codex <task-slug>
+```
+
+Codex exposes the current thread as `$CODEX_THREAD_ID`, which flow
+uses the same way it uses Claude's `$CLAUDE_CODE_SESSION_ID`: spawned
+or bound sessions are written to the task row and later resumed by
+`flow do`.
+
+Install the flow skill for Codex with:
+
+```bash
+flow skill install --harness codex
+```
+
+That writes the skill to `~/.agents/skills/flow/SKILL.md` and wires
+the Codex hook. If Codex prompts you to review hooks, open `/hooks`
+and trust the flow hook before expecting automatic session binding.
+
+### Manual Codex QA
+
+Use an isolated worktree, temp binary, and temp flow root so the smoke
+run never touches your normal `~/.flow` data:
+
+```bash
+cd /private/tmp/flow-codex-support
+mkdir -p /private/tmp/flow-codex-support/bin /private/tmp/flow-codex-dev/flow-root
+GOCACHE=/private/tmp/flow-codex-dev/go-cache go build -o /private/tmp/flow-codex-support/bin/flow .
+export FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root
+export PATH=/private/tmp/flow-codex-support/bin:$PATH
+flow init
+```
+
+Before installing the Codex skill or hook, back up the real Codex
+integration files:
+
+```bash
+mkdir -p /private/tmp/flow-codex-dev/backups
+cp -R ~/.agents/skills/flow /private/tmp/flow-codex-dev/backups/flow-skill 2>/dev/null || true
+cp ~/.codex/hooks.json /private/tmp/flow-codex-dev/backups/hooks.json 2>/dev/null || true
+flow skill install --harness codex --force
+```
+
+After install, review Codex `/hooks` and trust the flow hook if Codex
+asks. Then smoke the Codex path under the temp `FLOW_ROOT`:
+
+```bash
+FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow init
+FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow add task "Codex Smoke" --slug codex-smoke --work-dir /private/tmp/flow-codex-support
+FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow skill install --harness codex --force
+FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow do --harness codex codex-smoke
+FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow transcript codex-smoke --compact
+FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow done codex-smoke
+```
+
 ## What you get
 
 - **One task, one Claude session, one tab.** `flow do <task>`
@@ -367,19 +428,19 @@ and reinstall the skill + hook.
 ## Where flow runs (and where we'd love help)
 
 Today flow runs on **macOS (iTerm2, Warp, stock Terminal.app, kitty,
-or zellij) + Claude Code only**. That's the stack we use, and that's
-what the session-spawn layer was built and tested against. zellij
-and kitty work on Linux too as a side effect — both are
-cross-platform and flow's zellij / kitty backends don't depend on
-any macOS APIs. Kitty needs `allow_remote_control yes` (or
-`socket-only`) in `kitty.conf` so flow can drive `kitty @ launch`
-from inside the running kitty instance.
+or zellij) with Claude Code by default and Codex available as an
+explicit harness**. That's the stack we use, and that's what the
+session-spawn layer was built and tested against. zellij and kitty
+work on Linux too as a side effect — both are cross-platform and
+flow's zellij / kitty backends don't depend on any macOS APIs. Kitty
+needs `allow_remote_control yes` (or `socket-only`) in `kitty.conf` so
+flow can drive `kitty @ launch` from inside the running kitty instance.
 
-The architecture is portable — session spawning is one small
-package — but other harnesses (Codex, Cursor, plain shell) and other
-terminals (Linux + tmux/wezterm, Windows Terminal) need contributors
-who run those stacks daily and care enough to wire them in. If that's
-you, [a PR is very welcome](CONTRIBUTING.md).
+The architecture is portable — session spawning is one small package —
+but other harnesses (Cursor, plain shell) and other terminals (Linux +
+tmux/wezterm, Windows Terminal) need contributors who run those stacks
+daily and care enough to wire them in. If that's you, [a PR is very
+welcome](CONTRIBUTING.md).
 
 ## Where flow came from
 

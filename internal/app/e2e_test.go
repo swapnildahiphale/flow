@@ -8,6 +8,7 @@ import (
 	"flow/internal/spawner"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -240,5 +241,102 @@ func TestE2EFullRoundtrip(t *testing.T) {
 	}
 	if wd == nil {
 		t.Fatal("GetWorkdir returned nil for auto-registered path")
+	}
+}
+
+func TestE2ECodexHarnessRoundtrip(t *testing.T) {
+	tmp := t.TempDir()
+	flowRoot := filepath.Join(tmp, "flow")
+	codexHome := filepath.Join(tmp, "codex-home")
+	t.Setenv("FLOW_ROOT", flowRoot)
+	t.Setenv("HOME", tmp)
+	t.Setenv("CODEX_HOME", codexHome)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	t.Setenv("CODEX_THREAD_ID", "")
+
+	repo := filepath.Join(tmp, "code", "codex-smoke")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, getScript := stubITerm(t)
+
+	const sid = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
+	calls := stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+		switch call {
+		case 1:
+			return []byte(`{"type":"thread.started","thread":{"thread_id":"` + sid + `"}}` + "\n"), nil
+		case 2:
+			return nil, nil
+		case 3:
+			return nil, nil
+		default:
+			t.Fatalf("unexpected codex call %d: %q", call, args)
+			return nil, nil
+		}
+	})
+
+	step := func(name string, rc int) {
+		t.Helper()
+		if rc != 0 {
+			t.Fatalf("%s: rc=%d", name, rc)
+		}
+	}
+
+	step("init", cmdInit(nil))
+	step("add task", cmdAdd([]string{"task", "Codex Smoke", "--work-dir", repo}))
+	step("do codex", cmdDo([]string{"--harness", "codex", "codex-smoke"}))
+
+	db, err := flowdb.OpenDB(filepath.Join(flowRoot, "flow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	task, err := flowdb.GetTask(db, "codex-smoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.Harness.Valid || task.Harness.String != "codex" {
+		t.Fatalf("harness after codex do: got %+v, want codex", task.Harness)
+	}
+	if !task.SessionID.Valid || task.SessionID.String != sid {
+		t.Fatalf("session_id after codex do: got %+v, want %s", task.SessionID, sid)
+	}
+	if task.Status != "in-progress" {
+		t.Fatalf("status after codex do: got %q, want in-progress", task.Status)
+	}
+	if script := getScript(); !strings.Contains(script, "codex resume "+sid) {
+		t.Fatalf("spawn script missing codex resume: %s", script)
+	}
+
+	writeAppCodexRollout(t, codexHome, sid, `{"type":"session_meta","payload":{"id":"`+sid+`"},"timestamp":"2026-05-28T10:00:00Z"}
+{"type":"event_msg","payload":{"type":"user_message","message":"codex smoke user"},"timestamp":"2026-05-28T10:00:01Z"}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"codex smoke assistant"}]},"timestamp":"2026-05-28T10:00:02Z"}
+`)
+
+	var transcriptRC int
+	out := captureStdout(t, func() {
+		transcriptRC = cmdTranscript([]string{"codex-smoke", "--compact"})
+	})
+	step("transcript codex", transcriptRC)
+	for _, want := range []string{"codex smoke user", "codex smoke assistant"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("transcript output missing %q:\n%s", want, out)
+		}
+	}
+
+	step("done codex", cmdDone([]string{"codex-smoke"}))
+	task, err = flowdb.GetTask(db, "codex-smoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "done" {
+		t.Fatalf("status after done: got %q, want done", task.Status)
+	}
+	if len(*calls) != 3 {
+		t.Fatalf("codex calls=%d, want 3 (%#v)", len(*calls), *calls)
+	}
+	if got := (*calls)[2].args; len(got) < 4 || got[0] != "exec" || !strings.Contains(got[3], "flow transcript codex-smoke") {
+		t.Fatalf("codex close-out args=%q", got)
 	}
 }
