@@ -94,8 +94,9 @@ func cmdHookSessionStart(args []string) int {
 			"`brief:` path AND every file listed under `updates:`; "+
 			"(3) if a project is listed on the task, run `flow show project <that-slug>` "+
 			"and Read its brief and updates too; "+
-			"(4) Read `CLAUDE.md` in your work_dir and any nested CLAUDE.md under "+
-			"subdirectories you plan to modify. "+
+			"(4) Read repo instruction files in your work_dir (`AGENTS.md`, "+
+			"`CLAUDE.md`, or equivalent) and any nested instruction files "+
+			"under subdirectories you plan to modify. "+
 			"Only then proceed with the user's request. "+
 			"If any brief section is blank or unclear, ASK — do not infer. "+
 			"The `kb:` section of `flow show task` lists the knowledge-base files "+

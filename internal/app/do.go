@@ -90,9 +90,9 @@ func openConcurrentDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// cmdDo flips a task to in-progress, bootstraps a Claude session if
+// cmdDo flips a task to in-progress, bootstraps a harness session if
 // needed (race-free via atomic UPDATE ... WHERE session_id IS ?), and
-// spawns an iTerm tab to resume it. See spec §6 for the full protocol.
+// spawns a terminal tab to resume it. See spec §6 for the full protocol.
 func cmdDo(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "error: do requires a task ref")
@@ -101,7 +101,7 @@ func cmdDo(args []string) int {
 	fs := flagSet("do")
 	fresh := fs.Bool("fresh", false, "discard existing session and re-bootstrap")
 	dangerSkip := fs.Bool("dangerously-skip-permissions", false, "skip per-tool approval prompts in the spawned harness")
-	force := fs.Bool("force", false, "open even if the task's Claude session is already running elsewhere")
+	force := fs.Bool("force", false, "open even if the task's harness session is already running elsewhere")
 	here := fs.Bool("here", false, "bind THIS harness session to the task (no new tab); requires running inside a known harness session")
 	harnessFlag := fs.String("harness", "auto", "agent harness to use: auto, claude, or codex")
 	withInstr := fs.String("with", "", "inject `<instruction>` as the first user message after the bootstrap/resume")
@@ -552,13 +552,13 @@ func bootstrapPromptForTask(db *sql.DB, task *flowdb.Task) (string, int) {
 //
 // The bootstrap prompt is intentionally shell-safe — no single/double
 // quotes, backticks, or dollar signs — because it gets shell-quoted
-// as a single positional argument to `claude`.
+// as a single positional argument to a harness command.
 //
-// The session's UUID is pre-allocated by `flow do` and passed via
-// `claude --session-id <uuid>`, so there is no self-registration step
-// here. The session loads context in order: task brief + task updates,
-// then (if any) project brief + project updates, then CLAUDE.md files
-// in the work_dir. The flow skill enforces this sequence too; the
+// The session id is bound by `flow do` before the interactive tab opens,
+// so there is no self-registration step here. The session loads context
+// in order: task brief + task updates, then (if any) project brief +
+// project updates, then repo instruction files in the work_dir. The flow
+// skill enforces this sequence too; the
 // bootstrap prompt is a backup in case the skill isn't auto-activated.
 // Kept for callers (and tests) that don't track first-run state. New
 // callers should use buildBootstrapPromptForKindV2 to opt into the
@@ -586,7 +586,7 @@ func buildTaskBootstrapPrompt(slug string) string {
 			"1. Invoke the flow skill via the Skill tool. This loads the operating manual that governs how this session works: workflows, bootstrap contract, KB discipline, and scope-creep detection.\n"+
 			"2. Run: flow show task. Read the file at the brief: path AND every file listed under updates:. Files listed under other: are sidecar references — load on demand when relevant, not eagerly.\n"+
 			"3. If a project is listed on the task, run: flow show project <that-project-slug>. Read its brief AND every file under updates:. Files under other: are on-demand references.\n"+
-			"4. Read CLAUDE.md in your work_dir and any nested CLAUDE.md files under subdirectories you will modify. These override any assumption from the brief.\n"+
+			"4. Read repo instruction files in your work_dir (AGENTS.md, CLAUDE.md, or equivalent) and any nested instruction files under subdirectories you will modify. These override any assumption from the brief.\n"+
 			"5. Only then begin work. If any brief section is blank or unclear, ASK — do not infer.",
 		slug,
 	)
@@ -604,7 +604,7 @@ func buildPlaybookRunBootstrapPrompt(runSlug, playbookSlug string, isFirstRun bo
 			"2. Run: flow show playbook %s. This shows the playbook's definition and recent runs — context only, not your instructions. Note any files listed under other: — they're sidecar references you can Read on demand if relevant; do not eagerly load them.\n"+
 			"3. Run: flow show task. Read the file at the brief: path AND every file listed under updates:. Files under other: are references for THIS run; load on demand when relevant. The brief is your authoritative instructions for this run — it was snapshotted from the playbook at the moment this run started. Execute against this, not the live playbook brief.\n"+
 			"4. If a project is listed on the task, run: flow show project <that-project-slug>. Read its brief and every file under updates:. Files under other: are on-demand references.\n"+
-			"5. Read CLAUDE.md in your work_dir.\n"+
+			"5. Read repo instruction files in your work_dir (AGENTS.md, CLAUDE.md, or equivalent) and any nested instruction files under subdirectories you will modify.\n"+
 			"6. Only then begin executing your brief.\n"+
 			"\n"+
 			"While executing: if the user adjusts the playbook's procedure during this run (e.g. 'let's always do X', 'change the approach for...', 'this step should also...'), pause and ask via AskUserQuestion whether to persist the change to the playbook's live brief.md so future runs benefit. Options: 'Persist to playbook' (Edit playbooks/%s/brief.md), 'Just this run' (no change to live playbook), 'Both — persist + log a note in playbooks/%s/updates/'. The run's own brief.md is a frozen snapshot — never edit it to change future behavior; that's what the live playbook brief is for. See flow skill §4.13 for the full pattern.",
@@ -671,13 +671,12 @@ func findTask(db *sql.DB, query string) (*flowdb.Task, int) {
 }
 
 // cmdDoHere is the `--here` branch of `flow do`. Instead of spawning
-// a new tab with a fresh Claude session, it binds the CURRENT Claude
-// session (discovered via $CLAUDE_CODE_SESSION_ID) to the named task
-// and flips the task to in-progress.
+// a new tab with a fresh harness session, it binds the current harness
+// session (discovered via that harness's session env var) to the named
+// task and flips the task to in-progress.
 //
 // Safety:
-//   - Refuses if not running inside a Claude Code session
-//     (CLAUDE_CODE_SESSION_ID unset).
+//   - Refuses if not running inside the selected harness session.
 //   - Refuses if the target task already has a different session_id
 //     bound. The constraint guards against silent overwrites that
 //     would orphan the prior session. --force overrides.

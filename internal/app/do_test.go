@@ -1513,6 +1513,12 @@ func TestBuildBootstrapPromptForRegularTask(t *testing.T) {
 	if !strings.Contains(got, "flow show task") {
 		t.Errorf("regular task prompt should mention flow show task:\n%s", got)
 	}
+	if !strings.Contains(got, "AGENTS.md, CLAUDE.md, or equivalent") {
+		t.Errorf("regular task prompt should mention harness-neutral repo instructions:\n%s", got)
+	}
+	if strings.Contains(got, "Read CLAUDE.md in your work_dir") {
+		t.Errorf("regular task prompt should not use Claude-only repo instruction wording:\n%s", got)
+	}
 }
 
 func TestBuildBootstrapPromptForKindWithEmptyKind(t *testing.T) {
@@ -1547,6 +1553,12 @@ func TestBuildPlaybookRunBootstrapPromptNotFirstRun(t *testing.T) {
 	// Still has the persist-adjustments paragraph (not first-run-specific).
 	if !strings.Contains(got, "adjusts the playbook") {
 		t.Errorf("base playbook prompt missing persist-adjustments para")
+	}
+	if !strings.Contains(got, "AGENTS.md, CLAUDE.md, or equivalent") {
+		t.Errorf("playbook prompt should mention harness-neutral repo instructions:\n%s", got)
+	}
+	if strings.Contains(got, "Read CLAUDE.md in your work_dir") {
+		t.Errorf("playbook prompt should not use Claude-only repo instruction wording:\n%s", got)
 	}
 }
 

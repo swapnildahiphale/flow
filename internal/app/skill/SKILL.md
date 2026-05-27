@@ -386,9 +386,9 @@ run `flow add task` until the user picks "Save it". If they pick
 
 **After `flow add task` succeeds**, it will print the task slug and
 the absolute path to a stub `brief.md`. The flow is **Read once, then
-Edit/Write**: Claude's `Write` and `Edit` tools both require a prior
-`Read` of any existing file before mutating it (this is the harness's
-guard against accidental overwrites). For brand-new tasks the stub
+Edit/Write**: before mutating an existing file, read it once so your
+editor/write tool has current contents and does not accidentally
+overwrite user changes. For brand-new tasks the stub
 contents are predictable, so a single `Read` followed by either:
 - `Edit` with `replace_all: true` (replaces the whole stub body), or
 - `Write` (overwrites in full)

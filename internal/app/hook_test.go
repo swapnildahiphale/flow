@@ -120,6 +120,12 @@ func TestHookSessionStartRequiresSkillInvocation(t *testing.T) {
 	if !strings.Contains(ctx, "some-slug") {
 		t.Errorf("additionalContext should mention the task slug, got:\n%s", ctx)
 	}
+	if !strings.Contains(ctx, "`AGENTS.md`") || !strings.Contains(ctx, "`CLAUDE.md`") {
+		t.Errorf("additionalContext must mention harness-neutral repo instructions, got:\n%s", ctx)
+	}
+	if strings.Contains(ctx, "Read `CLAUDE.md` in your work_dir") {
+		t.Errorf("additionalContext should not use Claude-only repo instruction wording:\n%s", ctx)
+	}
 }
 
 func TestHookSessionStartCodexUsesStdinSessionID(t *testing.T) {
@@ -290,5 +296,11 @@ func TestBuildBootstrapPromptInvokesSkill(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "task-x") {
 		t.Errorf("bootstrap prompt must mention the task slug")
+	}
+	if !strings.Contains(prompt, "AGENTS.md, CLAUDE.md, or equivalent") {
+		t.Errorf("bootstrap prompt must mention harness-neutral repo instructions:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Read CLAUDE.md in your work_dir") {
+		t.Errorf("bootstrap prompt should not use Claude-only repo instruction wording:\n%s", prompt)
 	}
 }

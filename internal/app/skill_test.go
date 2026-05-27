@@ -532,6 +532,8 @@ func TestSkillHasCodexHarnessSection(t *testing.T) {
 		"`flow do --here` reads the current session's UUID from\n`$CLAUDE_CODE_SESSION_ID`",
 		"Every Claude Code\nsession has `$CLAUDE_CODE_SESSION_ID`",
 		"headless Claude sweep",
+		"Claude's `Write` and `Edit` tools",
+		"Read CLAUDE.md in your work_dir",
 	} {
 		if strings.Contains(got, old) {
 			t.Errorf("skill still has Claude-only wording %q", old)
