@@ -102,8 +102,8 @@ func TestPrepareFreshSessionDangerousFlagAndRunnerErrorWins(t *testing.T) {
 	})
 
 	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{SkipPermissions: true})
-	if err == nil || !strings.Contains(err.Error(), "codex failed") {
-		t.Fatalf("err=%v, want runner error", err)
+	if err == nil || !strings.Contains(err.Error(), "codex allocate thread") || !strings.Contains(err.Error(), "codex failed") {
+		t.Fatalf("err=%v, want contextual runner error", err)
 	}
 	wantArgs := []string{
 		"exec",
@@ -148,6 +148,16 @@ func TestPrepareFreshSessionMalformedJSONAfterThreadStarted(t *testing.T) {
 	}
 }
 
+func TestPrepareFreshSessionRejectsInvalidThreadID(t *testing.T) {
+	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		return []byte(`{"type":"thread.started","thread":{"thread_id":"not-a-uuid"}}` + "\n"), nil
+	})
+	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{})
+	if err == nil || !strings.Contains(err.Error(), "not a valid codex thread UUID") {
+		t.Fatalf("err=%v, want invalid thread id error", err)
+	}
+}
+
 func TestBootstrapFreshSessionArgsAndInjection(t *testing.T) {
 	var gotArgs []string
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
@@ -175,6 +185,16 @@ func TestBootstrapFreshSessionArgsAndInjection(t *testing.T) {
 	}
 	if !slices.Equal(gotArgs, wantArgs) {
 		t.Fatalf("args=%q, want %q", gotArgs, wantArgs)
+	}
+}
+
+func TestBootstrapFreshSessionWrapsRunnerError(t *testing.T) {
+	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		return nil, errors.New("runner failed")
+	})
+	err := New().BootstrapFreshSession(harness.SessionContext{}, testThreadID, "bootstrap", harness.LaunchOpts{})
+	if err == nil || !strings.Contains(err.Error(), "codex bootstrap thread "+testThreadID) || !strings.Contains(err.Error(), "runner failed") {
+		t.Fatalf("err=%v, want contextual runner error", err)
 	}
 }
 
@@ -216,14 +236,78 @@ func TestSkipPermissionsRunUsesCodexExecDangerously(t *testing.T) {
 	}
 }
 
+func TestSkipPermissionsRunWrapsRunnerError(t *testing.T) {
+	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		return nil, errors.New("runner failed")
+	})
+	err := New().SkipPermissionsRun(harness.SessionContext{}, "sweep")
+	if err == nil || !strings.Contains(err.Error(), "codex close-out sweep") || !strings.Contains(err.Error(), "runner failed") {
+		t.Fatalf("err=%v, want contextual runner error", err)
+	}
+}
+
+func TestRunCodexAppliesContextAndCapturesOutput(t *testing.T) {
+	binDir := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "record.txt")
+	fakeCodex := filepath.Join(binDir, "codex")
+	script := `#!/bin/sh
+printf '%s\n' "$PWD" > "$CODEX_RECORD"
+printf '%s\n' "$FLOW_ROOT" >> "$CODEX_RECORD"
+printf '%s\n' "$*" >> "$CODEX_RECORD"
+if [ "$1" = "fail" ]; then
+  echo "partial stdout"
+  echo "bad stderr" >&2
+  exit 7
+fi
+echo "ok stdout"
+`
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	workDir := t.TempDir()
+	ctx := harness.SessionContext{
+		WorkDir: workDir,
+		Env:     append(os.Environ(), "FLOW_ROOT=/tmp/flow-root", "CODEX_RECORD="+recordPath),
+	}
+	out, err := runCodex(ctx, []string{"one", "two"})
+	if err != nil {
+		t.Fatalf("runCodex success: %v", err)
+	}
+	if string(out) != "ok stdout\n" {
+		t.Fatalf("stdout=%q", out)
+	}
+	record, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(record)), "\n")
+	resolvedWorkDir, err := filepath.EvalSymlinks(workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(lines, []string{resolvedWorkDir, "/tmp/flow-root", "one two"}) {
+		t.Fatalf("record lines=%q", lines)
+	}
+
+	out, err = runCodex(ctx, []string{"fail"})
+	if err == nil || !strings.Contains(err.Error(), "bad stderr") {
+		t.Fatalf("err=%v, want stderr in error", err)
+	}
+	if string(out) != "partial stdout\n" {
+		t.Fatalf("failure stdout=%q", out)
+	}
+}
+
 func TestLiveSessionIDsParsesCodexResumeRows(t *testing.T) {
 	old := PSRunner
 	t.Cleanup(func() { PSRunner = old })
 	PSRunner = func() ([]byte, error) {
 		return []byte(`  PID COMMAND
 1001 codex resume 018F3F8E-97F7-7CC2-A871-BFBFD8F4FD40
-1002 codex exec resume 018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40 'hello'
-1003 codex exec resume 11111111-2222-7333-8444-555555555555 'x' && codex resume 11111111-2222-7333-8444-555555555555
+1002 codex exec resume --skip-git-repo-check 018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40 'hello'
+1003 /opt/homebrew/bin/codex exec resume --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox 11111111-2222-7333-8444-555555555555 'x' && codex resume 11111111-2222-7333-8444-555555555555
 1004 codex exec --skip-git-repo-check 'not a resume'
 1005 grep codex resume 99999999-9999-7999-8999-999999999999
 `), nil
@@ -235,7 +319,6 @@ func TestLiveSessionIDsParsesCodexResumeRows(t *testing.T) {
 	want := map[string]int{
 		testThreadID:                           2,
 		"11111111-2222-7333-8444-555555555555": 1,
-		"99999999-9999-7999-8999-999999999999": 1,
 	}
 	if len(live) != len(want) {
 		t.Fatalf("live=%#v, want %#v", live, want)

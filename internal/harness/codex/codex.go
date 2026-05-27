@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,12 +60,16 @@ func (c *codex) PrepareFreshSession(ctx harness.SessionContext, prompt string, o
 
 	out, err := CommandRunner(ctx, args)
 	if err != nil {
-		return harness.PreparedSession{}, err
+		return harness.PreparedSession{}, fmt.Errorf("codex allocate thread: %w", err)
 	}
 	threadID, err := parseThreadStarted(out)
 	if err != nil {
 		return harness.PreparedSession{}, err
 	}
+	if err := c.ValidateSessionID(threadID); err != nil {
+		return harness.PreparedSession{}, err
+	}
+	threadID = strings.ToLower(threadID)
 	return harness.PreparedSession{
 		SessionID:     threadID,
 		LaunchCommand: c.ResumeCmd(threadID, harness.LaunchOpts{}),
@@ -81,7 +86,10 @@ func (c *codex) BootstrapFreshSession(ctx harness.SessionContext, sessionID, pro
 	}
 	args = append(args, sessionID, prompt)
 	_, err := CommandRunner(ctx, args)
-	return err
+	if err != nil {
+		return fmt.Errorf("codex bootstrap thread %s: %w", sessionID, err)
+	}
+	return nil
 }
 
 func (c *codex) ResumeCmd(sessionID string, opts harness.LaunchOpts) string {
@@ -103,7 +111,10 @@ func (c *codex) SkipPermissionsRun(ctx harness.SessionContext, prompt string) er
 		"--dangerously-bypass-approvals-and-sandbox",
 		prompt,
 	})
-	return err
+	if err != nil {
+		return fmt.Errorf("codex close-out sweep: %w", err)
+	}
+	return nil
 }
 
 type codexEvent struct {
@@ -158,8 +169,6 @@ func runCodex(ctx harness.SessionContext, args []string) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
-var runningRe = regexp.MustCompile(`codex\s+(?:exec\s+)?resume\s+(` + sessionIDRe.String()[1:len(sessionIDRe.String())-1] + `)`)
-
 func (c *codex) LiveSessionIDs() (map[string]int, error) {
 	out, err := PSRunner()
 	if err != nil {
@@ -167,23 +176,43 @@ func (c *codex) LiveSessionIDs() (map[string]int, error) {
 	}
 	live := make(map[string]int)
 	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.Contains(line, "codex") {
-			continue
-		}
-		seen := map[string]bool{}
-		for _, m := range runningRe.FindAllStringSubmatch(line, -1) {
-			if len(m) < 2 {
-				continue
-			}
-			id := strings.ToLower(m[1])
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
+		for _, id := range liveSessionIDsFromPSLine(line) {
 			live[id]++
 		}
 	}
 	return live, nil
+}
+
+func liveSessionIDsFromPSLine(line string) []string {
+	fields := strings.Fields(line)
+	if len(fields) == 0 || fields[0] == "PID" {
+		return nil
+	}
+	if _, err := strconv.Atoi(fields[0]); err == nil {
+		fields = fields[1:]
+	}
+	if len(fields) == 0 || filepath.Base(fields[0]) != "codex" {
+		return nil
+	}
+
+	i := 1
+	if i < len(fields) && fields[i] == "exec" {
+		i++
+	}
+	if i >= len(fields) || fields[i] != "resume" {
+		return nil
+	}
+	for _, tok := range fields[i+1:] {
+		tok = strings.Trim(tok, `'"`)
+		if strings.HasPrefix(tok, "-") {
+			continue
+		}
+		if sessionIDRe.MatchString(tok) {
+			return []string{strings.ToLower(tok)}
+		}
+		return nil
+	}
+	return nil
 }
 
 func runPS() ([]byte, error) {
