@@ -211,16 +211,15 @@ func renderCodexRecord(w io.Writer, rec codexRolloutRecord, compact bool, first 
 		item := responseItem(rec)
 		switch item.Type {
 		case "message":
+			if item.Role != "assistant" {
+				return false
+			}
 			text := extractCodexText(item.Content)
 			if text == "" {
 				return false
 			}
 			printGap(w, first)
-			if item.Role == "user" {
-				fmt.Fprintln(w, "─── User ───")
-			} else {
-				fmt.Fprintln(w, "─── Assistant ───")
-			}
+			fmt.Fprintln(w, "─── Assistant ───")
 			fmt.Fprintln(w, text)
 			return true
 		case "function_call":

@@ -47,6 +47,8 @@ func TestRenderTranscriptRealCodexPayloadShapes(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", home)
 	raw := `{"type":"session_meta","payload":{"id":"` + testThreadID + `"},"timestamp":"2026-05-28T10:00:00Z"}
+{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"developer instructions"}]},"timestamp":"2026-05-28T10:00:00Z"}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"duplicate user request"}]},"timestamp":"2026-05-28T10:00:00Z"}
 {"type":"event_msg","payload":{"type":"user_message","message":"real user request"},"timestamp":"2026-05-28T10:00:01Z"}
 {"type":"event_msg","payload":{"type":"agent_message","message":"duplicate assistant event"},"timestamp":"2026-05-28T10:00:02Z"}
 {"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"real assistant reply"}]},"timestamp":"2026-05-28T10:00:03Z"}
@@ -66,6 +68,11 @@ func TestRenderTranscriptRealCodexPayloadShapes(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "duplicate assistant event") {
 		t.Fatalf("agent_message duplicate should be skipped:\n%s", out.String())
+	}
+	for _, unwanted := range []string{"developer instructions", "duplicate user request"} {
+		if strings.Contains(out.String(), unwanted) {
+			t.Fatalf("response_item %q should be skipped:\n%s", unwanted, out.String())
+		}
 	}
 }
 
