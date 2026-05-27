@@ -1010,8 +1010,8 @@ category of fact. Signals that it's time to Read one:
   want to reflect the user's working style accurately → read `user.md`.
 - The user asks "how do we usually do X?" or "what's our convention
   for Y?" → read `processes.md`.
-- A brief or CLAUDE.md uses terminology you don't recognize (e.g.
-  an internal codename, a product term, a legacy component name) →
+- A brief or repo instruction file uses terminology you don't recognize
+  (e.g. an internal codename, a product term, a legacy component name) →
   read the relevant kb file for definitions.
 - You're generating cross-cutting advice ("how should I approach
   this?") that would benefit from context about the user's role,
