@@ -365,6 +365,58 @@ func TestSkillInstallHarnessAllWritesClaudeAndCodex(t *testing.T) {
 	}
 }
 
+func TestSkillUpdateHarnessCodexWritesOnlyAgentSkill(t *testing.T) {
+	home := withTempHome(t)
+	codexPath := filepath.Join(home, ".agents", "skills", "flow", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(codexPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(codexPath, []byte("old codex skill"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc := cmdSkill([]string{"update", "--harness", "codex"}); rc != 0 {
+		t.Fatalf("update --harness codex rc=%d", rc)
+	}
+	data, err := os.ReadFile(codexPath)
+	if err != nil {
+		t.Fatalf("read codex skill: %v", err)
+	}
+	if !strings.Contains(string(data), "name: flow") || strings.Contains(string(data), "old codex skill") {
+		t.Fatalf("codex skill was not refreshed")
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude", "skills", "flow", "SKILL.md")); !os.IsNotExist(err) {
+		t.Fatalf("claude skill should not be installed by --harness codex update; err=%v", err)
+	}
+}
+
+func TestSkillUpdateHarnessAllRefreshesClaudeAndCodex(t *testing.T) {
+	home := withTempHome(t)
+	claudePath := filepath.Join(home, ".claude", "skills", "flow", "SKILL.md")
+	codexPath := filepath.Join(home, ".agents", "skills", "flow", "SKILL.md")
+	for _, path := range []string{claudePath, codexPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("old skill"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if rc := cmdSkill([]string{"update", "--harness", "all"}); rc != 0 {
+		t.Fatalf("update --harness all rc=%d", rc)
+	}
+	for _, path := range []string{claudePath, codexPath} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(data), "name: flow") || strings.Contains(string(data), "old skill") {
+			t.Fatalf("skill was not refreshed at %s", path)
+		}
+	}
+}
+
 func TestSkillInstallCodexWritesDistinctHookCommand(t *testing.T) {
 	home := withTempHome(t)
 
@@ -395,6 +447,25 @@ func TestSkillUninstallHarnessCodexRemovesOnlyCodexSkill(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".claude", "skills", "flow", "SKILL.md")); err != nil {
 		t.Fatalf("claude skill should remain: %v", err)
+	}
+}
+
+func TestSkillUninstallHarnessAllRemovesClaudeAndCodexSkills(t *testing.T) {
+	home := withTempHome(t)
+	if rc := cmdSkill([]string{"install", "--harness", "all"}); rc != 0 {
+		t.Fatalf("install --harness all rc=%d", rc)
+	}
+
+	if rc := cmdSkill([]string{"uninstall", "--harness", "all"}); rc != 0 {
+		t.Fatalf("uninstall --harness all rc=%d", rc)
+	}
+	for _, dir := range []string{
+		filepath.Join(home, ".claude", "skills", "flow"),
+		filepath.Join(home, ".agents", "skills", "flow"),
+	} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("skill dir still present or unexpected err for %s: %v", dir, err)
+		}
 	}
 }
 

@@ -1201,7 +1201,7 @@ stop.
      conversation is bound to it. No new tab. Pick when the user wants the
      playbook to execute in the current chat (preserves transcript, no tab
      switch). Implicitly skips the `--dangerously-skip-permissions` question
-     — there's no claude spawn to forward it to.
+     — there is no new harness spawn to forward it to.
    - **New tab — regular** — runs `flow run playbook <slug>`. Spawns a
      fresh tab with tool-approval prompts.
    - **New tab — skip permissions** — runs `flow run playbook <slug>
@@ -1427,11 +1427,16 @@ via `AskUserQuestion`.
 3. Download the new binary per the README and replace the existing
    one (typically at `/usr/local/bin/flow`; confirm with
    `which flow` if unsure).
-4. Run `flow skill update` to refresh the embedded skill on disk and
-   re-wire both the SessionStart and UserPromptSubmit hooks in
-   `~/.claude/settings.json`. (The auto-upgrade path runs the same
-   refresh on the next `flow` invocation, but explicit is better and
-   surfaces any errors immediately.)
+4. Run `flow skill update` to refresh the embedded skill on disk for
+   the default harness. If you use Codex too, run
+   `flow skill update --harness codex`; to refresh every installed
+   harness, run `flow skill update --harness all`. The update re-wires
+   the relevant SessionStart hook (`~/.claude/settings.json` for
+   Claude, `~/.codex/hooks.json` for Codex) and removes stale legacy
+   prompt hooks where that harness supports them. (The auto-upgrade
+   path refreshes already-installed harness skills on the next `flow`
+   invocation, but explicit is better and surfaces any errors
+   immediately.)
 5. Run `flow --version` again and confirm the version changed. If it
    did not change, the binary on `$PATH` is still the old one —
    check `which flow` against the path you wrote to.
@@ -2006,8 +2011,9 @@ yours), use:
 flow transcript <sibling-task-slug>
 ```
 
-This outputs a readable conversation transcript from that task's Claude
-session — user messages, assistant messages, tool calls, and results.
+This outputs a readable conversation transcript from that task's
+selected harness session — user messages, assistant messages, tool
+calls, and results.
 Use `--compact` to omit tool results and thinking blocks for a shorter
 overview. Pipe through `grep` or `head` if the full transcript is too
 long to read at once.
