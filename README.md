@@ -208,9 +208,9 @@ In any Claude Code session:
 > Upgrade flow from https://github.com/Facets-cloud/flow
 
 Claude fetches the latest release binary and runs `flow skill
-update` to refresh the skill and re-wire the SessionStart and
-UserPromptSubmit hooks. Check the running version with
-`flow --version`.
+update` to refresh the skill, re-wire the SessionStart hook, and
+remove stale legacy prompt hooks from older installs. Check the
+running version with `flow --version`.
 
 ## Quickstart
 
@@ -244,20 +244,23 @@ and trust the flow hook before expecting automatic session binding.
 
 ### Manual Codex QA
 
-Use an isolated worktree, temp binary, and temp flow root so the smoke
-run never touches your normal `~/.flow` data:
+Use an isolated worktree, temp binary, temp home, and temp flow root so
+the smoke run never touches your normal `~/.flow`, Claude, or Codex
+integration files:
 
 ```bash
 cd /private/tmp/flow-codex-support
-mkdir -p /private/tmp/flow-codex-support/bin /private/tmp/flow-codex-dev/flow-root
+mkdir -p /private/tmp/flow-codex-support/bin /private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-dev/home
 GOCACHE=/private/tmp/flow-codex-dev/go-cache go build -o /private/tmp/flow-codex-support/bin/flow .
 export FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root
+export HOME=/private/tmp/flow-codex-dev/home
 export PATH=/private/tmp/flow-codex-support/bin:$PATH
 flow init
 ```
 
-Before installing the Codex skill or hook, back up the real Codex
-integration files:
+`flow init` installs the default Claude skill and hook under the temp
+`HOME` above. Before intentionally installing the Codex skill or hook
+against your real home, back up the real Codex integration files:
 
 ```bash
 ts=$(date +%Y%m%d%H%M%S)
@@ -267,15 +270,15 @@ flow skill install --harness codex --force
 ```
 
 After install, review Codex `/hooks` and trust the flow hook if Codex
-asks. Then smoke the Codex path under the temp `FLOW_ROOT`:
+asks. Then smoke the Codex path under the temp `HOME` and `FLOW_ROOT`:
 
 ```bash
-FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow init
-FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow add task "Codex Smoke" --slug codex-smoke --work-dir /private/tmp/flow-codex-support
-FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow skill install --harness codex --force
-FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow do --harness codex codex-smoke
-FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow transcript codex-smoke --compact
-FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow done codex-smoke
+HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow init
+HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow add task "Codex Smoke" --slug codex-smoke --work-dir /private/tmp/flow-codex-support
+HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow skill install --harness codex --force
+HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow do --harness codex codex-smoke
+HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow transcript codex-smoke --compact
+HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow done codex-smoke
 ```
 
 ## What you get
@@ -304,19 +307,26 @@ FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/
 
 ## How it works under the hood
 
-`flow do <task>` pre-allocates a session UUID, writes it to the
-task row, and spawns a tab in zellij (when `$ZELLIJ` is set), kitty
+`flow do <task>` binds a harness session id to the task row and
+spawns a tab in zellij (when `$ZELLIJ` is set), kitty
 (when `$KITTY_WINDOW_ID` is set or `$TERM=xterm-kitty`), the backend
 named in `$FLOW_TERM` (when set), or Warp / iTerm2 / stock
 Terminal.app (auto-detected from `$TERM_PROGRAM`) — chosen in that
-priority order, with iTerm as the historical fallback — running
+priority order, with iTerm as the historical fallback.
+
+For the default Claude harness, flow pre-allocates a UUID and runs
 `claude --session-id <uuid>` with `FLOW_TASK` / `FLOW_PROJECT` inlined.
-The jsonl file lands at the deterministic path
-`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, so future
-`flow do` calls run `claude --resume <uuid>` to continue the same
-conversation. A SessionStart hook re-injects the task brief,
-updates, and CLAUDE.md context on every resume; a UserPromptSubmit
-hook keeps the flow skill discoverable in ad-hoc Claude sessions.
+The jsonl file lands at
+`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, so future `flow do`
+calls run `claude --resume <uuid>` to continue the same conversation.
+A SessionStart hook re-injects the task brief, updates, and repo
+instruction context on every resume.
+
+For the Codex harness, flow asks `codex exec --json` for a thread id,
+stores it in the task row, bootstraps the task with `codex exec resume
+<id>`, and opens `codex resume <id>` interactively. Codex exposes the
+current thread as `$CODEX_THREAD_ID`; transcripts render from Codex
+rollout logs under `$CODEX_HOME/sessions` or `~/.codex/sessions`.
 
 When `flow do <task>` is run for a task whose session is already
 live in another tab, flow focuses that tab instead of spawning a
