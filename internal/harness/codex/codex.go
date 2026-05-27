@@ -115,6 +115,7 @@ type codexEvent struct {
 
 func parseThreadStarted(out []byte) (string, error) {
 	dec := json.NewDecoder(bytes.NewReader(out))
+	var threadID string
 	for {
 		var ev codexEvent
 		if err := dec.Decode(&ev); err != nil {
@@ -129,9 +130,14 @@ func parseThreadStarted(out []byte) (string, error) {
 		if ev.Thread.ThreadID == "" {
 			return "", fmt.Errorf("codex thread.started missing thread.thread_id")
 		}
-		return ev.Thread.ThreadID, nil
+		if threadID == "" {
+			threadID = ev.Thread.ThreadID
+		}
 	}
-	return "", fmt.Errorf("codex output did not include thread.started event")
+	if threadID == "" {
+		return "", fmt.Errorf("codex output did not include thread.started event")
+	}
+	return threadID, nil
 }
 
 func runCodex(ctx harness.SessionContext, args []string) ([]byte, error) {

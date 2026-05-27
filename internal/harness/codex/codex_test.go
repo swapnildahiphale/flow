@@ -137,6 +137,17 @@ func TestPrepareFreshSessionMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestPrepareFreshSessionMalformedJSONAfterThreadStarted(t *testing.T) {
+	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		return []byte(`{"type":"thread.started","thread":{"thread_id":"` + testThreadID + `"}}` + "\n" +
+			`{"type":"broken"`), nil
+	})
+	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{})
+	if err == nil || !strings.Contains(err.Error(), "parse codex json") {
+		t.Fatalf("err=%v, want malformed JSON error", err)
+	}
+}
+
 func TestBootstrapFreshSessionArgsAndInjection(t *testing.T) {
 	var gotArgs []string
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {

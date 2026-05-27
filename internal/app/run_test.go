@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"flow/internal/flowdb"
-	"flow/internal/harness"
+	"flow/internal/harness/claude"
 )
 
 func TestRunSlugBasic(t *testing.T) {
@@ -205,33 +205,25 @@ func TestCmdRunPlaybookRejectsUnknownHarness(t *testing.T) {
 	assertNoPlaybookRunRows(t, "deploy")
 }
 
-func TestCmdRunPlaybookExplicitCodexPinsRunTask(t *testing.T) {
+func TestCmdRunPlaybookExplicitCodexFailsBeforeRunRowWhenUnsupported(t *testing.T) {
 	setupFlowRoot(t)
+	withHarnessRegistry(t, claude.New())
 	wd := t.TempDir()
 	if rc := cmdAdd([]string{"playbook", "Deploy", "--slug", "deploy", "--work-dir", wd}); rc != 0 {
 		t.Fatal()
 	}
 	stubITerm(t)
-	stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
-		if call == 1 {
-			return []byte(`{"type":"thread.started","thread":{"thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}}` + "\n"), nil
-		}
-		return nil, nil
-	})
 
+	stderr := captureStderr(t)
 	rc := cmdRun([]string{"playbook", "deploy", "--harness", "codex"})
-	if rc != 0 {
-		t.Fatalf("cmdRun rc=%d", rc)
+	if rc == 0 {
+		t.Fatalf("cmdRun rc=%d, want non-zero", rc)
 	}
-
-	db := openFlowDB(t)
-	var harnessName string
-	if err := db.QueryRow(`SELECT COALESCE(harness, '') FROM tasks WHERE kind='playbook_run' AND playbook_slug='deploy'`).Scan(&harnessName); err != nil {
-		t.Fatal(err)
+	got := stderr()
+	if !strings.Contains(got, "codex") || !strings.Contains(got, "isn't supported") {
+		t.Fatalf("stderr=%q", got)
 	}
-	if harnessName != "codex" {
-		t.Fatalf("run harness=%q, want codex", harnessName)
-	}
+	assertNoPlaybookRunRows(t, "deploy")
 }
 
 func TestCmdRunPlaybookExplicitClaudePinsRunTask(t *testing.T) {
@@ -256,32 +248,25 @@ func TestCmdRunPlaybookExplicitClaudePinsRunTask(t *testing.T) {
 	}
 }
 
-func TestCmdRunPlaybookHereExplicitCodexPinsRunTask(t *testing.T) {
+func TestCmdRunPlaybookHereExplicitCodexFailsBeforeRunRowWhenUnsupported(t *testing.T) {
 	setupFlowRoot(t)
+	withHarnessRegistry(t, claude.New())
 	wd := t.TempDir()
 	if rc := cmdAdd([]string{"playbook", "Deploy", "--slug", "deploy", "--work-dir", wd}); rc != 0 {
 		t.Fatal()
 	}
 	stubITerm(t)
-	const sid = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
-	t.Setenv("CODEX_THREAD_ID", sid)
 
+	stderr := captureStderr(t)
 	rc := cmdRun([]string{"playbook", "deploy", "--here", "--harness", "codex"})
-	if rc != 0 {
-		t.Fatalf("cmdRun rc=%d", rc)
+	if rc == 0 {
+		t.Fatalf("cmdRun rc=%d, want non-zero", rc)
 	}
-
-	db := openFlowDB(t)
-	var harnessName, sessionID string
-	if err := db.QueryRow(`SELECT COALESCE(harness, ''), COALESCE(session_id, '') FROM tasks WHERE kind='playbook_run' AND playbook_slug='deploy'`).Scan(&harnessName, &sessionID); err != nil {
-		t.Fatal(err)
+	got := stderr()
+	if !strings.Contains(got, "codex") || !strings.Contains(got, "isn't supported") {
+		t.Fatalf("stderr=%q", got)
 	}
-	if harnessName != "codex" {
-		t.Fatalf("run harness=%q, want codex", harnessName)
-	}
-	if sessionID != sid {
-		t.Fatalf("run session_id=%q, want %q", sessionID, sid)
-	}
+	assertNoPlaybookRunRows(t, "deploy")
 }
 
 // ---------- flow run playbook --here ----------
