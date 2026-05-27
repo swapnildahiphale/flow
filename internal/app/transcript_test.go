@@ -87,25 +87,34 @@ func TestTranscriptNoRefAmbiguousAmbientErrors(t *testing.T) {
 
 func TestTranscriptNoRefCodexAmbient(t *testing.T) {
 	setupFlowRoot(t)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
 	seedTaskAtCwd(t, "codex-transcript")
 	const sid = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
 	db := openFlowDB(t)
 	if _, err := db.Exec(
 		`UPDATE tasks SET harness='codex', session_id=?, session_started=?, status='in-progress', updated_at=? WHERE slug='codex-transcript'`,
-		sid, flowdb.NowISO(), flowdb.NowISO(),
+		sid, "2026-05-28T10:00:00Z", flowdb.NowISO(),
 	); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("CODEX_THREAD_ID", sid)
+	writeAppCodexRollout(t, codexHome, sid, `{"type":"session_meta","payload":{"id":"`+sid+`"},"timestamp":"2026-05-28T10:00:00Z"}
+{"type":"event_msg","payload":{"role":"user","content":"ambient user text"},"timestamp":"2026-05-28T10:00:01Z"}
+{"type":"event_msg","payload":{"role":"assistant","content":"ambient assistant text"},"timestamp":"2026-05-28T10:00:02Z"}
+`)
 
-	stderr := captureStderr(t)
-	rc := cmdTranscript(nil)
-	if rc != 1 {
-		t.Fatalf("rc=%d, want 1 until codex transcript rendering lands", rc)
+	var rc int
+	out := captureStdout(t, func() {
+		rc = cmdTranscript(nil)
+	})
+	if rc != 0 {
+		t.Fatalf("rc=%d, want 0; output=%q", rc, out)
 	}
-	got := stderr()
-	if !strings.Contains(got, "codex transcript rendering is not wired yet") {
-		t.Fatalf("stderr=%q", got)
+	for _, want := range []string{"ambient user text", "ambient assistant text"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
 	}
 }
 
@@ -147,5 +156,16 @@ func TestTranscriptCmdWithSession(t *testing.T) {
 	rc := cmdTranscript([]string{"tx-test"})
 	if rc != 0 {
 		t.Errorf("transcript with session: rc=%d, want 0", rc)
+	}
+}
+
+func writeAppCodexRollout(t *testing.T, home, sid, raw string) {
+	t.Helper()
+	p := filepath.Join(home, "sessions", "2026", "05", "28", "rollout-"+sid+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

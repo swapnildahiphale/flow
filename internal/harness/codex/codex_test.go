@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"flow/internal/harness"
 )
@@ -632,14 +631,6 @@ func TestCodexSessionStartHookWarningDetectsDisabledConfig(t *testing.T) {
 	want := "Codex hooks may be disabled; review ~/.codex/config.toml and Codex /hooks"
 	if got := h.SessionStartHookWarning(); got != want {
 		t.Fatalf("warning=%q, want %q", got, want)
-	}
-}
-
-func TestCodexTranscriptUnsupportedForNow(t *testing.T) {
-	h := New()
-	var out strings.Builder
-	if err := h.RenderTranscript("/tmp/work", testThreadID, false, time.Time{}, &out); err == nil || !strings.Contains(err.Error(), "not wired yet") {
-		t.Fatalf("RenderTranscript err=%v, want unsupported", err)
 	}
 }
 

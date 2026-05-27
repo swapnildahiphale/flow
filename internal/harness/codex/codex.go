@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"flow/internal/harness"
 	"flow/internal/spawner"
@@ -223,10 +222,6 @@ func liveSessionIDsFromPSLine(line string) []string {
 
 func runPS() ([]byte, error) {
 	return exec.Command("ps", "-axo", "pid,command").Output()
-}
-
-func (c *codex) RenderTranscript(cwd, sessionID string, compact bool, cutoff time.Time, w io.Writer) error {
-	return fmt.Errorf("codex transcript rendering is not wired yet")
 }
 
 func (c *codex) SkillInstallPath() (string, error) {
