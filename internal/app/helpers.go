@@ -4,8 +4,11 @@ import (
 	"database/sql"
 	"errors"
 	"flag"
-	"flow/internal/flowdb"
+	"fmt"
 	"os"
+	"strings"
+
+	"flow/internal/flowdb"
 )
 
 // flagSet creates a named flag.FlagSet that prints errors instead of exiting.
@@ -18,11 +21,15 @@ func flagSet(name string) *flag.FlagSet {
 // currentSessionID returns this process's harness session id, or ""
 // if not running inside any known harness. Probes every implemented
 // harness's session-id env var and returns the one that's set.
-func currentSessionID() string {
-	if h := ambientHarness(); h != nil {
-		return os.Getenv(h.SessionIDEnvVar())
+func currentSessionID() (string, error) {
+	ambient := ambientHarnessResultForEnv()
+	if len(ambient.Matches) > 1 {
+		return "", fmt.Errorf("multiple harness session env vars are set (%s)", strings.Join(ambient.Matches, ", "))
 	}
-	return ""
+	if ambient.Harness == nil {
+		return "", nil
+	}
+	return ambient.Value, nil
 }
 
 // currentSessionTask returns the task bound to this Claude session
@@ -31,7 +38,11 @@ func currentSessionID() string {
 // the canonical "what task am I on?" lookup — replaces the legacy
 // $FLOW_TASK env var.
 func currentSessionTask(db *sql.DB) (*flowdb.Task, error) {
-	return flowdb.TaskBySessionID(db, currentSessionID())
+	sid, err := currentSessionID()
+	if err != nil {
+		return nil, err
+	}
+	return flowdb.TaskBySessionID(db, sid)
 }
 
 // isNoBindingErr is a small predicate for the dispatch-session case.

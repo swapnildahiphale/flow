@@ -102,7 +102,8 @@ func cmdDo(args []string) int {
 	fresh := fs.Bool("fresh", false, "discard existing session and re-bootstrap")
 	dangerSkip := fs.Bool("dangerously-skip-permissions", false, "skip per-tool approval prompts in the spawned harness")
 	force := fs.Bool("force", false, "open even if the task's Claude session is already running elsewhere")
-	here := fs.Bool("here", false, "bind THIS Claude session to the task (no new tab); requires running inside a Claude Code session")
+	here := fs.Bool("here", false, "bind THIS harness session to the task (no new tab); requires running inside a known harness session")
+	harnessFlag := fs.String("harness", "auto", "agent harness to use: auto, claude, or codex")
 	withInstr := fs.String("with", "", "inject `<instruction>` as the first user message after the bootstrap/resume")
 	withFile := fs.String("with-file", "", "inject 'read instructions at <path>' (mutually exclusive with --with)")
 	// Two-pass parse so the slug positional may appear before OR after
@@ -119,6 +120,11 @@ func cmdDo(args []string) int {
 	if err := fs.Parse(fs.Args()[1:]); err != nil {
 		return 2
 	}
+	explicitHarness, err := parseHarnessName(*harnessFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
 
 	injectionText, rc := loadInjectionText(fs, *withInstr, *withFile)
 	if rc != 0 {
@@ -130,7 +136,7 @@ func cmdDo(args []string) int {
 	}
 
 	if *here {
-		return cmdDoHere(query, *force)
+		return cmdDoHere(query, *force, explicitHarness)
 	}
 
 	dbPath, err := flowDBPath()
@@ -168,7 +174,7 @@ func cmdDo(args []string) int {
 	// before, task.harness is set and binding; otherwise detect from
 	// the current process's ambient harness env (so `flow do` from
 	// inside codex picks codex), falling back to claude.
-	h, err := harnessForSpawn(task)
+	h, err := harnessForSpawn(task, explicitHarness, *fresh)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -680,11 +686,37 @@ func findTask(db *sql.DB, query string) (*flowdb.Task, int) {
 // The DB write is the only side effect — no terminal spawn, no env
 // var injection. Subsequent `flow do <slug>` from elsewhere will
 // resume this session via `claude --resume`.
-func cmdDoHere(query string, force bool) int {
+func cmdDoHere(query string, force bool, explicit harness.Name) int {
 	// --here only makes sense from inside a harness session. Probe
 	// ambient explicitly — defaultHarness's claude fallback would
 	// mask the "user isn't in any harness" case.
-	h := ambientHarness()
+	var h harness.Harness
+	var sid string
+	if explicit != "" {
+		var err error
+		h, err = harnessByName(string(explicit))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 1
+		}
+		sid = os.Getenv(h.SessionIDEnvVar())
+		if sid == "" {
+			fmt.Fprintf(os.Stderr,
+				"error: --here with --harness %s requires $%s to be set\n",
+				explicit, h.SessionIDEnvVar())
+			return 1
+		}
+	} else {
+		ambient := ambientHarnessResultForEnv()
+		if len(ambient.Matches) > 1 {
+			fmt.Fprintf(os.Stderr,
+				"error: --here sees multiple harness session env vars (%s); pass --harness to choose one\n",
+				strings.Join(ambient.Matches, ", "))
+			return 1
+		}
+		h = ambient.Harness
+		sid = ambient.Value
+	}
 	if h == nil {
 		var probed []string
 		for _, hh := range allHarnesses() {
@@ -695,7 +727,6 @@ func cmdDoHere(query string, force bool) int {
 			strings.Join(probed, ", "))
 		return 1
 	}
-	sid := os.Getenv(h.SessionIDEnvVar())
 	if err := h.ValidateSessionID(sid); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"error: $%s is not a valid session id (%v)\n",

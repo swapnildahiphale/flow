@@ -1794,7 +1794,7 @@ func TestCmdDoHereRefusesWhenTranscriptMissing(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
 
 	stderr := captureStderr(t)
-	rc := cmdDoHere("mismatch-task", false)
+	rc := cmdDoHere("mismatch-task", false, "")
 	if rc != 1 {
 		t.Errorf("cmdDoHere with missing transcript rc=%d, want 1", rc)
 	}
@@ -1845,7 +1845,7 @@ func TestCmdDoHereForceDoesNotBypassCwdGate(t *testing.T) {
 	db.Close()
 
 	t.Setenv("CLAUDE_CODE_SESSION_ID", newSID)
-	if rc := cmdDoHere("force-mismatch", true); rc != 1 {
+	if rc := cmdDoHere("force-mismatch", true, ""); rc != 1 {
 		t.Errorf("cmdDoHere --force with cwd mismatch rc=%d, want 1", rc)
 	}
 

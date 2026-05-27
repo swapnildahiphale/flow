@@ -88,7 +88,7 @@ Create:
   flow add task    "<name>" [--slug <s>] [--project <slug>] [--work-dir <path>] [--mkdir] [--priority h|m|l] [--due <date>]
 
 Sessions:
-  flow do                <ref> [--fresh] [--dangerously-skip-permissions]
+  flow do                <ref> [--fresh] [--harness auto|claude|codex] [--dangerously-skip-permissions]
   flow done              <ref>
   flow hook session-start                      (SessionStart hook handler — wire via ~/.claude/settings.json)
 
@@ -109,8 +109,8 @@ Edit / mutate:
                             [--waiting "<who or what>"] [--clear-waiting]
                             [--tag <t> ...] [--remove-tag <t> ...] [--clear-tags]
   flow update project <ref> [--priority h|m|l]
-  flow do        <ref> [--fresh] [--dangerously-skip-permissions] [--force]   (spawn a new tab; --force overrides the live-session guard)
-  flow do --here <ref> [--force]                                              (bind THIS Claude session to the task; --force overwrites a prior binding)
+  flow do        <ref> [--fresh] [--harness auto|claude|codex] [--dangerously-skip-permissions] [--force]   (spawn a new tab; --force overrides the live-session guard)
+  flow do --here <ref> [--harness auto|claude|codex] [--force]                                              (bind THIS harness session to the task; --force overwrites a prior binding)
   flow archive   <ref>
   flow unarchive <ref>
 
@@ -122,8 +122,8 @@ Workdirs:
 
 Playbooks:
   flow add playbook   "<name>" --work-dir <path> [--slug <s>] [--project <slug>] [--mkdir]
-  flow run playbook   <slug> [--dangerously-skip-permissions]   (spawn a new tab)
-  flow run playbook   <slug> --here                              (bind THIS Claude session to the new run; no new tab)
+  flow run playbook   <slug> [--harness auto|claude|codex] [--dangerously-skip-permissions]   (spawn a new tab)
+  flow run playbook   <slug> --here [--harness auto|claude|codex]                              (bind THIS harness session to the new run; no new tab)
   flow show playbook  <ref>
   flow list playbooks [--project <slug>] [--include-archived]`)
 }

@@ -45,11 +45,17 @@ func cmdTranscript(args []string) int {
 		bound, lookupErr := currentSessionTask(db)
 		if lookupErr != nil {
 			if isNoBindingErr(lookupErr) {
-				if currentSessionID() == "" {
-					fmt.Fprintln(os.Stderr, "error: no task ref given and not running inside a Claude session ($CLAUDE_CODE_SESSION_ID unset)")
+				if sid, sidErr := currentSessionID(); sidErr != nil {
+					fmt.Fprintf(os.Stderr, "error: no task ref given and %v; pass a task ref explicitly\n", sidErr)
+				} else if sid == "" {
+					fmt.Fprintln(os.Stderr, "error: no task ref given and not running inside a known harness session")
 				} else {
-					fmt.Fprintln(os.Stderr, "error: no task ref given and this Claude session is not bound to a task")
+					fmt.Fprintln(os.Stderr, "error: no task ref given and this harness session is not bound to a task")
 				}
+				return 2
+			}
+			if strings.Contains(lookupErr.Error(), "multiple harness session env vars") {
+				fmt.Fprintf(os.Stderr, "error: no task ref given and %v; pass a task ref explicitly\n", lookupErr)
 				return 2
 			}
 			fmt.Fprintf(os.Stderr, "error: lookup task by session: %v\n", lookupErr)

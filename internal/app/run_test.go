@@ -66,7 +66,7 @@ func TestRunSlugSecondCollision(t *testing.T) {
 
 func TestRunSlugUTCNormalization(t *testing.T) {
 	db := openTempDB(t)
-	loc, _ := time.LoadLocation("Asia/Kolkata") // UTC+5:30
+	loc, _ := time.LoadLocation("Asia/Kolkata")        // UTC+5:30
 	local := time.Date(2026, 4, 30, 16, 0, 45, 0, loc) // 10:30 UTC
 	got, err := generateRunSlug(db, "p", local)
 	if err != nil {
@@ -184,6 +184,86 @@ func TestCmdRunPlaybookMissing(t *testing.T) {
 	if rc := cmdRun([]string{"playbook", "no-such"}); rc == 0 {
 		t.Errorf("expected non-zero rc for missing playbook")
 	}
+}
+
+func TestCmdRunPlaybookRejectsUnknownHarness(t *testing.T) {
+	setupFlowRoot(t)
+	wd := t.TempDir()
+	if rc := cmdAdd([]string{"playbook", "Deploy", "--slug", "deploy", "--work-dir", wd}); rc != 0 {
+		t.Fatal()
+	}
+	stderr := captureStderr(t)
+	rc := cmdRun([]string{"playbook", "deploy", "--harness", "wat"})
+	if rc != 2 {
+		t.Fatalf("cmdRun rc=%d, want 2", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "unknown harness") {
+		t.Fatalf("stderr=%q", got)
+	}
+	assertNoPlaybookRunRows(t, "deploy")
+}
+
+func TestCmdRunPlaybookExplicitCodexFailsBeforeRunRow(t *testing.T) {
+	setupFlowRoot(t)
+	wd := t.TempDir()
+	if rc := cmdAdd([]string{"playbook", "Deploy", "--slug", "deploy", "--work-dir", wd}); rc != 0 {
+		t.Fatal()
+	}
+	stubITerm(t)
+
+	stderr := captureStderr(t)
+	rc := cmdRun([]string{"playbook", "deploy", "--harness", "codex"})
+	if rc == 0 {
+		t.Fatalf("cmdRun rc=%d, want non-zero", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "codex") || !strings.Contains(got, "isn't supported") {
+		t.Fatalf("stderr=%q", got)
+	}
+	assertNoPlaybookRunRows(t, "deploy")
+}
+
+func TestCmdRunPlaybookExplicitClaudePinsRunTask(t *testing.T) {
+	setupFlowRoot(t)
+	wd := t.TempDir()
+	if rc := cmdAdd([]string{"playbook", "Deploy", "--slug", "deploy", "--work-dir", wd}); rc != 0 {
+		t.Fatal()
+	}
+	stubITerm(t)
+
+	if rc := cmdRun([]string{"playbook", "deploy", "--harness", "claude"}); rc != 0 {
+		t.Fatalf("cmdRun rc=%d", rc)
+	}
+
+	db := openFlowDB(t)
+	var harnessName string
+	if err := db.QueryRow(`SELECT COALESCE(harness, '') FROM tasks WHERE kind='playbook_run' AND playbook_slug='deploy'`).Scan(&harnessName); err != nil {
+		t.Fatal(err)
+	}
+	if harnessName != "claude" {
+		t.Fatalf("run harness=%q, want claude", harnessName)
+	}
+}
+
+func TestCmdRunPlaybookHereExplicitCodexFailsBeforeRunRow(t *testing.T) {
+	setupFlowRoot(t)
+	wd := t.TempDir()
+	if rc := cmdAdd([]string{"playbook", "Deploy", "--slug", "deploy", "--work-dir", wd}); rc != 0 {
+		t.Fatal()
+	}
+	stubITerm(t)
+
+	stderr := captureStderr(t)
+	rc := cmdRun([]string{"playbook", "deploy", "--here", "--harness", "codex"})
+	if rc == 0 {
+		t.Fatalf("cmdRun rc=%d, want non-zero", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "codex") || !strings.Contains(got, "isn't supported") {
+		t.Fatalf("stderr=%q", got)
+	}
+	assertNoPlaybookRunRows(t, "deploy")
 }
 
 // ---------- flow run playbook --here ----------
@@ -395,5 +475,17 @@ func TestCmdRunPlaybookWithEmptyRejectedBeforeRowInsert(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("rejected --with should not insert a run row; got %d rows", n)
+	}
+}
+
+func assertNoPlaybookRunRows(t *testing.T, playbookSlug string) {
+	t.Helper()
+	db := openFlowDB(t)
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE kind='playbook_run' AND playbook_slug=?`, playbookSlug).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("playbook_run rows for %s=%d, want 0", playbookSlug, n)
 	}
 }

@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"flow/internal/flowdb"
+	"flow/internal/harness"
 )
 
 // cmdRun handles `flow run <subcommand>`. Currently only `run playbook <slug>` is supported.
@@ -36,11 +38,30 @@ func cmdRunPlaybook(args []string) int {
 	slug := args[0]
 	fs := flagSet("run playbook")
 	dangerSkip := fs.Bool("dangerously-skip-permissions", false, "skip per-tool approval prompts in the spawned harness (ignored when --here is set)")
-	here := fs.Bool("here", false, "bind THIS Claude session to the new playbook run (no new tab); requires running inside a Claude Code session")
+	here := fs.Bool("here", false, "bind THIS harness session to the new playbook run (no new tab); requires running inside a known harness session")
+	harnessFlag := fs.String("harness", "auto", "agent harness to use: auto, claude, or codex")
 	withInstr := fs.String("with", "", "inject `<instruction>` as the run session's first user message (forwarded to flow do)")
 	withFile := fs.String("with-file", "", "inject 'read instructions at <path>' (forwarded to flow do)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
+	}
+	explicitHarness, err := parseHarnessName(*harnessFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
+	var explicitResolved harness.Harness
+	if explicitHarness != "" {
+		explicitResolved, err = harnessByName(string(explicitHarness))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 1
+		}
+	} else if ambient := ambientHarnessResultForEnv(); len(ambient.Matches) > 1 {
+		fmt.Fprintf(os.Stderr,
+			"error: multiple harness session env vars are set (%s); pass --harness to choose one\n",
+			strings.Join(ambient.Matches, ", "))
+		return 1
 	}
 
 	// Reject misuse before we materialize the run-task row.
@@ -75,12 +96,35 @@ func cmdRunPlaybook(args []string) int {
 	// backlog playbook_run task when env is wrong or this session is
 	// already owned by another task.
 	if *here {
-		h := defaultHarness()
-		sid := currentSessionID()
+		h := explicitResolved
+		var sid string
+		if explicitHarness != "" {
+			sid = os.Getenv(h.SessionIDEnvVar())
+			if sid == "" {
+				fmt.Fprintf(os.Stderr,
+					"error: --here with --harness %s requires $%s to be set\n",
+					explicitHarness, h.SessionIDEnvVar())
+				return 1
+			}
+		} else {
+			ambient := ambientHarnessResultForEnv()
+			if len(ambient.Matches) > 1 {
+				fmt.Fprintf(os.Stderr,
+					"error: --here sees multiple harness session env vars (%s); pass --harness to choose one\n",
+					strings.Join(ambient.Matches, ", "))
+				return 1
+			}
+			h = ambient.Harness
+			sid = ambient.Value
+		}
 		if sid == "" {
+			var probed []string
+			for _, hh := range allHarnesses() {
+				probed = append(probed, "$"+hh.SessionIDEnvVar())
+			}
 			fmt.Fprintf(os.Stderr,
-				"error: --here requires running inside a Claude Code session ($%s is unset)\n",
-				h.SessionIDEnvVar())
+				"error: --here requires running inside a known harness session; none of %s is set\n",
+				strings.Join(probed, ", "))
 			return 1
 		}
 		if err := h.ValidateSessionID(sid); err != nil {
@@ -171,13 +215,16 @@ func cmdRunPlaybook(args []string) int {
 		// — there's no claude process to forward the flag to. Run task
 		// was inserted with work_dir = os.Getwd() above so cmdDoHere's
 		// cwd-matches-work_dir invariant check passes without --force.
-		return cmdDoHere(runSlug, false)
+		return cmdDoHere(runSlug, false, explicitHarness)
 	}
 
 	// Default path: delegate to cmdDo to spawn the session in a new tab.
 	doArgs := []string{runSlug}
 	if *dangerSkip {
 		doArgs = append(doArgs, "--dangerously-skip-permissions")
+	}
+	if explicitHarness != "" {
+		doArgs = append(doArgs, "--harness", string(explicitHarness))
 	}
 	if *withInstr != "" {
 		doArgs = append(doArgs, "--with", *withInstr)

@@ -1,12 +1,15 @@
 package app
 
 import (
-	"flow/internal/flowdb"
-	"flow/internal/harness/claude"
-	"flow/internal/iterm"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"flow/internal/flowdb"
+	"flow/internal/harness"
+	"flow/internal/harness/claude"
+	"flow/internal/iterm"
 )
 
 // Parser-level tests live in internal/harness/claude/transcript_test.go
@@ -30,6 +33,39 @@ func TestTranscriptCmdNoSession(t *testing.T) {
 	rc := cmdTranscript([]string{"no-session"})
 	if rc != 1 {
 		t.Errorf("transcript with no session: rc=%d, want 1", rc)
+	}
+}
+
+func TestTranscriptCmdNoRefNoHarnessEnvMessage(t *testing.T) {
+	setupFlowRoot(t)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+
+	stderr := captureStderr(t)
+	rc := cmdTranscript(nil)
+	if rc != 2 {
+		t.Fatalf("rc=%d, want 2", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "not running inside a known harness session") {
+		t.Fatalf("stderr=%q", got)
+	}
+}
+
+func TestTranscriptCmdNoRefAmbiguousHarnessEnvMessage(t *testing.T) {
+	setupFlowRoot(t)
+	fakeCodex := fakeHarness{name: harness.NameCodex, envVar: "CODEX_THREAD_ID"}
+	withHarnessRegistry(t, claude.New(), fakeCodex)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "658bf2be-5ae3-4842-a8a4-e0d0b785514d")
+	t.Setenv("CODEX_THREAD_ID", "thread-1")
+
+	stderr := captureStderr(t)
+	rc := cmdTranscript(nil)
+	if rc != 2 {
+		t.Fatalf("rc=%d, want 2", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "multiple harness session env vars") || !strings.Contains(got, "pass a task ref explicitly") {
+		t.Fatalf("stderr=%q", got)
 	}
 }
 

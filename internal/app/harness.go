@@ -10,15 +10,19 @@ import (
 	"flow/internal/harness/claude"
 )
 
-// allHarnesses returns every implemented harness adapter. The slice
-// is the registry that ambient-harness detection and harnessByName
-// consult. Adding codex/gemini = one line each here.
-func allHarnesses() []harness.Harness {
+var harnessRegistry = func() []harness.Harness {
 	return []harness.Harness{
 		claude.New(),
 		// codex.New(),    // wired when the codex adapter lands
 		// gemini.New(),   // wired when the gemini adapter lands
 	}
+}
+
+// allHarnesses returns every implemented harness adapter. The slice
+// is the registry that ambient-harness detection and harnessByName
+// consult. Adding codex/gemini = one line each here.
+func allHarnesses() []harness.Harness {
+	return harnessRegistry()
 }
 
 // registeredHarnessNames returns the comma-joined list of harness
@@ -55,9 +59,22 @@ func harnessByName(name string) (harness.Harness, error) {
 		}
 	}
 	return nil, fmt.Errorf(
-		"task is pinned to harness %q which isn't supported by this flow binary (registered: %s) — upgrade flow, or update tasks.harness via sqlite",
+		"harness %q isn't supported by this flow binary (registered: %s) — upgrade flow, or update tasks.harness via sqlite",
 		name, registeredHarnessNames(),
 	)
+}
+
+func parseHarnessName(raw string) (harness.Name, error) {
+	switch raw {
+	case "", "auto":
+		return "", nil
+	case string(harness.NameClaude):
+		return harness.NameClaude, nil
+	case string(harness.NameCodex):
+		return harness.NameCodex, nil
+	default:
+		return "", fmt.Errorf("unknown harness %q (registered: %s)", raw, registeredHarnessNames())
+	}
 }
 
 // harnessForTask returns the adapter for the task's stored harness.
@@ -82,17 +99,35 @@ func harnessForTask(task *flowdb.Task) (harness.Harness, error) {
 // exactly one is set; returns nil if none are set OR if multiple
 // are (defensive — shouldn't happen in practice, but if a user
 // nests sessions we'd rather refuse to guess than pick wrong).
-func ambientHarness() harness.Harness {
-	var matches []harness.Harness
+type ambientHarnessResult struct {
+	Harness harness.Harness
+	EnvVar  string
+	Value   string
+	Matches []string
+}
+
+func ambientHarnessResultForEnv() ambientHarnessResult {
+	var out ambientHarnessResult
 	for _, h := range allHarnesses() {
 		if v := os.Getenv(h.SessionIDEnvVar()); v != "" {
-			matches = append(matches, h)
+			out.Matches = append(out.Matches, h.SessionIDEnvVar())
+			if out.Harness == nil {
+				out.Harness = h
+				out.EnvVar = h.SessionIDEnvVar()
+				out.Value = v
+			}
 		}
 	}
-	if len(matches) == 1 {
-		return matches[0]
+	if len(out.Matches) != 1 {
+		out.Harness = nil
+		out.EnvVar = ""
+		out.Value = ""
 	}
-	return nil
+	return out
+}
+
+func ambientHarness() harness.Harness {
+	return ambientHarnessResultForEnv().Harness
 }
 
 // harnessForSpawn returns the harness to use when bootstrapping a
@@ -110,12 +145,29 @@ func ambientHarness() harness.Harness {
 // each fresh session bind. Existing harness pins are resolved through
 // step 1 before that write, so subsequent invocations keep using the
 // pinned adapter unless an explicit rebinding path changes it.
-func harnessForSpawn(task *flowdb.Task) (harness.Harness, error) {
+func harnessForSpawn(task *flowdb.Task, explicit harness.Name, allowSwitch bool) (harness.Harness, error) {
 	if task != nil && task.Harness.Valid && task.Harness.String != "" {
-		return harnessByName(task.Harness.String)
+		pinned, err := harnessByName(task.Harness.String)
+		if err != nil {
+			return nil, err
+		}
+		if explicit != "" && explicit != pinned.Name() && !allowSwitch {
+			return nil, fmt.Errorf("task %q is pinned to harness %q; pass --fresh to replace it with %q", task.Slug, pinned.Name(), explicit)
+		}
+		if explicit != "" && explicit != pinned.Name() && allowSwitch {
+			return harnessByName(string(explicit))
+		}
+		return pinned, nil
 	}
-	if h := ambientHarness(); h != nil {
-		return h, nil
+	if explicit != "" {
+		return harnessByName(string(explicit))
+	}
+	ambient := ambientHarnessResultForEnv()
+	if len(ambient.Matches) > 1 {
+		return nil, fmt.Errorf("multiple harness session env vars are set (%s); pass --harness to choose one", strings.Join(ambient.Matches, ", "))
+	}
+	if ambient.Harness != nil {
+		return ambient.Harness, nil
 	}
 	return claude.New(), nil
 }

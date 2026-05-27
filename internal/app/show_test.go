@@ -3,13 +3,16 @@ package app
 import (
 	"bytes"
 	"database/sql"
-	"flow/internal/flowdb"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"flow/internal/flowdb"
+	"flow/internal/harness"
+	"flow/internal/harness/claude"
 )
 
 // withTempFlowRoot points FLOW_ROOT at a fresh tempdir and returns the
@@ -157,8 +160,25 @@ func TestCmdShowTaskMissingDefault(t *testing.T) {
 			t.Errorf("rc=%d, want 1", rc)
 		}
 	})
-	if !strings.Contains(out, "CLAUDE_CODE_SESSION_ID") {
+	if !strings.Contains(out, "not running inside a known harness session") {
 		t.Errorf("missing env hint; out=%q", out)
+	}
+}
+
+func TestCmdShowTaskAmbiguousDefault(t *testing.T) {
+	_, _ = showListEditDB(t)
+	fakeCodex := fakeHarness{name: harness.NameCodex, envVar: "CODEX_THREAD_ID"}
+	withHarnessRegistry(t, claude.New(), fakeCodex)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "deadbeef-1111-4222-8333-444455556666")
+	t.Setenv("CODEX_THREAD_ID", "thread-1")
+
+	out := captureStdout(t, func() {
+		if rc := cmdShow([]string{"task"}); rc != 1 {
+			t.Errorf("rc=%d, want 1", rc)
+		}
+	})
+	if !strings.Contains(out, "multiple harness session env vars") || !strings.Contains(out, "pass a task ref explicitly") {
+		t.Errorf("missing ambiguity hint; out=%q", out)
 	}
 }
 

@@ -2,13 +2,56 @@ package app
 
 import (
 	"database/sql"
+	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"flow/internal/flowdb"
 	"flow/internal/harness"
 	"flow/internal/harness/claude"
 )
+
+type fakeHarness struct {
+	name   harness.Name
+	envVar string
+	binary string
+}
+
+func (f fakeHarness) Name() harness.Name { return f.name }
+func (f fakeHarness) Binary() string {
+	if f.binary != "" {
+		return f.binary
+	}
+	return string(f.name)
+}
+func (f fakeHarness) SessionIDEnvVar() string              { return f.envVar }
+func (f fakeHarness) ValidateSessionID(string) error       { return nil }
+func (f fakeHarness) ValidateSession(string, string) error { return nil }
+func (f fakeHarness) PrepareFreshSession(harness.SessionContext, string, harness.LaunchOpts) (harness.PreparedSession, error) {
+	return harness.PreparedSession{SessionID: "fake-session", LaunchCommand: "fake resume"}, nil
+}
+func (f fakeHarness) BootstrapFreshSession(harness.SessionContext, string, string, harness.LaunchOpts) error {
+	return nil
+}
+func (f fakeHarness) ResumeCmd(string, harness.LaunchOpts) string                       { return "fake resume" }
+func (f fakeHarness) SkipPermissionsRun(harness.SessionContext, string) error           { return nil }
+func (f fakeHarness) LiveSessionIDs() (map[string]int, error)                           { return map[string]int{}, nil }
+func (f fakeHarness) RenderTranscript(string, string, bool, time.Time, io.Writer) error { return nil }
+func (f fakeHarness) SkillInstallPath() (string, error)                                 { return "", nil }
+func (f fakeHarness) SkillVersionPath() (string, error)                                 { return "", nil }
+func (f fakeHarness) InstallSkill([]byte) error                                         { return nil }
+func (f fakeHarness) UninstallSkill() error                                             { return nil }
+func (f fakeHarness) InstallSessionStartHook(string) (bool, error)                      { return false, nil }
+func (f fakeHarness) UninstallSessionStartHook(string) (bool, error)                    { return false, nil }
+func (f fakeHarness) UninstallUserPromptSubmitHook(string) (bool, error)                { return false, nil }
+
+func withHarnessRegistry(t *testing.T, hs ...harness.Harness) {
+	t.Helper()
+	old := harnessRegistry
+	harnessRegistry = func() []harness.Harness { return hs }
+	t.Cleanup(func() { harnessRegistry = old })
+}
 
 // TestAmbientHarness covers the env-var probe: returns the matching
 // harness when its session-id env var is set, nil otherwise.
@@ -29,6 +72,35 @@ func TestAmbientHarness(t *testing.T) {
 	}
 	if got.Name() != harness.NameClaude {
 		t.Errorf("ambientHarness = %v, want claude", got.Name())
+	}
+}
+
+func TestParseHarnessName(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want harness.Name
+	}{
+		{"", ""},
+		{"auto", ""},
+		{"claude", harness.NameClaude},
+		{"codex", harness.NameCodex},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			got, err := parseHarnessName(tc.raw)
+			if err != nil {
+				t.Fatalf("parseHarnessName(%q): %v", tc.raw, err)
+			}
+			if got != tc.want {
+				t.Fatalf("parseHarnessName(%q)=%q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseHarnessNameRejectsUnknown(t *testing.T) {
+	if _, err := parseHarnessName("wat"); err == nil || !strings.Contains(err.Error(), "unknown harness") {
+		t.Fatalf("parseHarnessName(wat) err=%v, want unknown harness", err)
 	}
 }
 
@@ -94,6 +166,86 @@ func TestCmdDoPersistsHarnessOnBootstrap(t *testing.T) {
 	}
 	if !task.Harness.Valid || task.Harness.String != "claude" {
 		t.Errorf("task.harness after bootstrap = %+v, want claude", task.Harness)
+	}
+}
+
+func TestCmdDoExplicitClaudePersistsHarnessOnBootstrap(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "harness-explicit-claude")
+	_, _ = stubITerm(t)
+
+	for _, h := range allHarnesses() {
+		t.Setenv(h.SessionIDEnvVar(), "")
+	}
+
+	if rc := cmdDo([]string{"harness-explicit-claude", "--harness", "claude"}); rc != 0 {
+		t.Fatalf("cmdDo rc=%d", rc)
+	}
+
+	db := openFlowDB(t)
+	task, err := flowdb.GetTask(db, "harness-explicit-claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.Harness.Valid || task.Harness.String != "claude" {
+		t.Errorf("task.harness after bootstrap = %+v, want claude", task.Harness)
+	}
+}
+
+func TestCmdDoRejectsUnknownHarnessFlag(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "harness-wat")
+	count, _ := stubITerm(t)
+
+	stderr := captureStderr(t)
+	rc := cmdDo([]string{"harness-wat", "--harness", "wat"})
+	if rc != 2 {
+		t.Fatalf("cmdDo rc=%d, want 2", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "unknown harness") {
+		t.Fatalf("stderr=%q", got)
+	}
+	if *count != 0 {
+		t.Fatalf("spawn count=%d, want 0", *count)
+	}
+}
+
+func TestCmdDoExplicitCodexFailsBeforeSessionAllocation(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "harness-codex")
+	count, _ := stubITerm(t)
+
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) {
+		t.Fatal("claude.NewUUID should not be called for unsupported explicit codex")
+		return "", nil
+	}
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	stderr := captureStderr(t)
+	rc := cmdDo([]string{"harness-codex", "--harness", "codex"})
+	if rc == 0 {
+		t.Fatalf("cmdDo rc=%d, want non-zero", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "codex") || !strings.Contains(got, "isn't supported") {
+		t.Fatalf("stderr=%q", got)
+	}
+	if *count != 0 {
+		t.Fatalf("spawn count=%d, want 0", *count)
+	}
+
+	db := openFlowDB(t)
+	task, err := flowdb.GetTask(db, "harness-codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.SessionID.Valid {
+		t.Fatalf("session_id=%+v, want NULL", task.SessionID)
+	}
+	if task.Harness.Valid && task.Harness.String != "" {
+		t.Fatalf("harness=%+v, want NULL/empty", task.Harness)
 	}
 }
 
@@ -169,7 +321,7 @@ func TestCmdDoHerePersistsHarnessColumn(t *testing.T) {
 	const sid = "11111111-2222-4333-8444-555555555555"
 	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
 
-	if rc := cmdDoHere("here-harness", false); rc != 0 {
+	if rc := cmdDoHere("here-harness", false, ""); rc != 0 {
 		t.Fatalf("cmdDoHere rc=%d", rc)
 	}
 
@@ -208,7 +360,7 @@ func TestCmdDoHereRejectsCrossHarness(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
 
 	stderr := captureStderr(t)
-	rc := cmdDoHere("pinned-elsewhere", false)
+	rc := cmdDoHere("pinned-elsewhere", false, "")
 	if rc != 1 {
 		t.Errorf("cmdDoHere across harnesses rc=%d, want 1", rc)
 	}
@@ -255,7 +407,7 @@ func TestCmdDoHereForceSwitchesHarness(t *testing.T) {
 	const sid = "22222222-3333-4444-8555-666666666666"
 	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
 
-	if rc := cmdDoHere("force-switch", true); rc != 0 {
+	if rc := cmdDoHere("force-switch", true, ""); rc != 0 {
 		t.Fatalf("cmdDoHere --force rc=%d, want 0", rc)
 	}
 
@@ -291,7 +443,7 @@ func TestHarnessForSpawn_AllPathsLandOnClaudeToday(t *testing.T) {
 
 	mustResolve := func(t *testing.T, task *flowdb.Task) harness.Harness {
 		t.Helper()
-		h, err := harnessForSpawn(task)
+		h, err := harnessForSpawn(task, "", false)
 		if err != nil {
 			t.Fatalf("harnessForSpawn: unexpected error: %v", err)
 		}
@@ -324,4 +476,95 @@ func TestHarnessForSpawn_AllPathsLandOnClaudeToday(t *testing.T) {
 		t.Error("harnessForSpawn return doesn't satisfy harness.Harness")
 	}
 	_ = claude.New() // import-keep
+}
+
+func TestHarnessForSpawnExplicitClaudeOnUnpinnedTask(t *testing.T) {
+	task := &flowdb.Task{Slug: "t"}
+	h, err := harnessForSpawn(task, harness.NameClaude, false)
+	if err != nil {
+		t.Fatalf("harnessForSpawn: %v", err)
+	}
+	if h.Name() != harness.NameClaude {
+		t.Fatalf("got %s, want claude", h.Name())
+	}
+}
+
+func TestHarnessForSpawnPinnedClaudeExplicitCodexWithoutFreshErrors(t *testing.T) {
+	task := &flowdb.Task{
+		Slug:    "t",
+		Harness: sql.NullString{Valid: true, String: string(harness.NameClaude)},
+	}
+	_, err := harnessForSpawn(task, harness.NameCodex, false)
+	if err == nil || !strings.Contains(err.Error(), "pass --fresh") {
+		t.Fatalf("err=%v, want --fresh mismatch error", err)
+	}
+}
+
+func TestHarnessForSpawnPinnedClaudeExplicitCodexWithFreshResolvesExplicit(t *testing.T) {
+	fakeCodex := fakeHarness{name: harness.NameCodex, envVar: "CODEX_THREAD_ID"}
+	withHarnessRegistry(t, claude.New(), fakeCodex)
+	task := &flowdb.Task{
+		Slug:    "t",
+		Harness: sql.NullString{Valid: true, String: string(harness.NameClaude)},
+	}
+	h, err := harnessForSpawn(task, harness.NameCodex, true)
+	if err != nil {
+		t.Fatalf("harnessForSpawn: %v", err)
+	}
+	if h.Name() != harness.NameCodex {
+		t.Fatalf("got %s, want codex", h.Name())
+	}
+}
+
+func TestHarnessForSpawnExplicitCodexUnregisteredErrors(t *testing.T) {
+	_, err := harnessForSpawn(&flowdb.Task{Slug: "t"}, harness.NameCodex, false)
+	if err == nil || !strings.Contains(err.Error(), "codex") || !strings.Contains(err.Error(), "isn't supported") {
+		t.Fatalf("err=%v, want unsupported codex", err)
+	}
+}
+
+func TestHarnessForSpawnAmbiguousAmbientRequiresExplicit(t *testing.T) {
+	fakeCodex := fakeHarness{name: harness.NameCodex, envVar: "CODEX_THREAD_ID"}
+	withHarnessRegistry(t, claude.New(), fakeCodex)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "658bf2be-5ae3-4842-a8a4-e0d0b785514d")
+	t.Setenv("CODEX_THREAD_ID", "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40")
+	_, err := harnessForSpawn(&flowdb.Task{Slug: "t"}, "", false)
+	if err == nil || !strings.Contains(err.Error(), "multiple harness session env vars") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestCmdDoHereExplicitHarnessRequiresMatchingEnv(t *testing.T) {
+	setupFlowRoot(t)
+	seedTaskAtCwd(t, "here-explicit")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+
+	stderr := captureStderr(t)
+	rc := cmdDoHere("here-explicit", false, harness.NameClaude)
+	if rc != 1 {
+		t.Fatalf("rc=%d, want 1", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "--here with --harness claude requires $CLAUDE_CODE_SESSION_ID") {
+		t.Fatalf("stderr=%q", got)
+	}
+}
+
+func TestCmdDoHereAmbiguousAmbientRequiresExplicit(t *testing.T) {
+	setupFlowRoot(t)
+	seedTaskAtCwd(t, "here-ambiguous")
+	fakeCodex := fakeHarness{name: harness.NameCodex, envVar: "CODEX_THREAD_ID"}
+	withHarnessRegistry(t, claude.New(), fakeCodex)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "11111111-2222-4333-8444-555555555555")
+	t.Setenv("CODEX_THREAD_ID", "thread-1")
+
+	stderr := captureStderr(t)
+	rc := cmdDoHere("here-ambiguous", false, "")
+	if rc != 1 {
+		t.Fatalf("rc=%d, want 1", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "multiple harness session env vars") || !strings.Contains(got, "pass --harness") {
+		t.Fatalf("stderr=%q", got)
+	}
 }
