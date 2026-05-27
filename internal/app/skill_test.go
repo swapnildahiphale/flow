@@ -439,15 +439,28 @@ func TestSkillHasCodexHarnessSection(t *testing.T) {
 	got := string(embeddedSkill)
 	for _, want := range []string{
 		"### Codex harness",
+		"### 4.16 Bind an in-flight agent session to a task",
 		"flow do --harness codex <task>",
 		"flow do --here --harness codex <task>",
 		"$CODEX_THREAD_ID",
 		"$CLAUDE_CODE_SESSION_ID",
 		"~/.agents/skills/flow/SKILL.md",
 		"review Codex `/hooks`",
+		"Codex transcripts live\nunder `$CODEX_HOME/sessions`",
+		"`codex resume <id>` for Codex",
+		"Each supported\nharness exposes its current session id in env",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("skill missing Codex harness content %q", want)
+		}
+	}
+	for _, old := range []string{
+		"Bind an in-flight Claude session to a task",
+		"`flow do --here` reads the current session's UUID from\n`$CLAUDE_CODE_SESSION_ID`",
+		"Every Claude Code\nsession has `$CLAUDE_CODE_SESSION_ID`",
+	} {
+		if strings.Contains(got, old) {
+			t.Errorf("skill still has Claude-only wording %q", old)
 		}
 	}
 }

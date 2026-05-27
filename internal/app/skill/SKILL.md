@@ -452,7 +452,7 @@ turn. Otherwise, ask. Don't second-guess; preserve their right to
 skip by giving them the click, not by pre-deciding for them.
 
 Finally, offer how to proceed with the new task. The shape of the
-question depends on whether THIS Claude session is already bound to
+question depends on whether THIS agent session is already bound to
 another flow task. Probe with `flow show task` (no arg). If it
 errors with `not bound to a task`, the current session is unbound
 (dispatch); otherwise it already belongs to the task it resolved.
@@ -469,8 +469,8 @@ errors with `not bound to a task`, the current session is unbound
   the task has already begun in this session — which is the
   common case when intake was triggered by §4.14 from the
   SessionStart hook intercept. Run **`flow do --here <slug>`**
-  immediately (the binary reads `$CLAUDE_CODE_SESSION_ID`, binds,
-  and flips status to in-progress in one shot).
+  immediately (the binary reads the current harness session env,
+  binds, and flips status to in-progress in one shot).
 - **No, keep in backlog** — save and stop. Pick for future work
   the user won't touch today.
 
@@ -508,7 +508,7 @@ On "Yes", proceed to §4.4. On "No", stop.
 > **Different-tab hint.** "Continue here" only ever applies in
 > dispatch sessions and only ever attaches the *current* session.
 > If the user is creating a task to track work that happened in
-> a *different* Claude session they have open elsewhere, they
+> a *different* agent session they have open elsewhere, they
 > need to switch to that other tab and run `flow do --here
 > <slug>` there.
 
@@ -572,7 +572,7 @@ its own, it's the start of a two-or-more-step workflow.
        question: "Which session mode for <task-slug>?",
        header: "Session mode",
        options: [
-         { label: "Regular",          description: "Normal Claude session with tool-approval prompts (safer)" },
+        { label: "Regular",          description: "Normal harness session with tool-approval prompts (safer)" },
          { label: "Skip permissions", description: "Pass --dangerously-skip-permissions (faster, no prompts)" }
        ],
        multiSelect: false
@@ -594,7 +594,7 @@ its own, it's the start of a two-or-more-step workflow.
 exported the env vars. Your job is done. Report "opened tab: <title>"
 and stop. Do NOT:
 
-- Run diagnostic commands like `pgrep`, `ls ~/.claude/projects/...`,
+- Run diagnostic commands like `pgrep`, transcript-directory probes,
   or `osascript` to try to verify the tab opened.
 - Try to spawn a terminal tab yourself with osascript or zellij. `flow do` already
   did this.
@@ -608,7 +608,7 @@ not attempt workarounds; the user will decide what to do next.
 #### Special case: live-session guard
 
 `flow do` refuses to spawn when the task's `session_id` is already
-running in another Claude process — typically because the user has the
+running in another harness process — typically because the user has the
 task's tab open elsewhere and forgot. The error names the running
 session ID and points at `--force`. When you see it:
 
@@ -794,7 +794,7 @@ closure is a silent loss of durable knowledge.
    "Yes, save a note first" / "No, just mark done") to offer.
    On "Yes", run the §4.5 recipe first, then continue.
 3. Run `flow done <ref>`. **Do not close the terminal tab** and **do
-   not kill the Claude session** — `flow done` deliberately leaves
+   not kill the agent session** — `flow done` deliberately leaves
    both intact. The session_id stays on the task row so a future
    reopen can still resume it. The close-out sweep runs after the
    status flip; relay any NUDGE block `flow done` prints back to
@@ -1515,12 +1515,12 @@ rule as "tag values are unprefixed strings").
   tags they didn't explicitly name. The exception is when the user's
   request literally names the tag ("tag this `#frontend`").
 
-### 4.16 Bind an in-flight Claude session to a task
+### 4.16 Bind an in-flight agent session to a task
 
 **Triggers:** "bind this session to <task>", "track this session
 under <task>", "attach this conversation to <task>", "this session is
 for <task>". Also fires when the user manually creates a flow task
-while already deep in an ad-hoc Claude session and wants future
+while already deep in an ad-hoc agent session and wants future
 `flow do <slug>` to resume *this* conversation rather than start a
 new one. The §4.2 "Continue here" option is the most common entry
 point.
@@ -1532,18 +1532,19 @@ it via §4.2), run:
 flow do --here <slug>
 ```
 
-`flow do --here` reads the current session's UUID from
-`$CLAUDE_CODE_SESSION_ID` (Claude Code injects this into every
-session), validates it, and writes it to `tasks.session_id`. Side
-effects: status flips backlog → in-progress (the session-id
-invariant requires it). No terminal spawn happens; the binding is
-the only mutation.
+`flow do --here` reads the current session UUID from the active
+harness environment (`$CLAUDE_CODE_SESSION_ID` for Claude,
+`$CODEX_THREAD_ID` for Codex), validates it, and writes it to
+`tasks.session_id`. Use `flow do --here --harness codex <slug>` to
+force Codex when needed. Side effects: status flips backlog →
+in-progress (the session-id invariant requires it). No terminal
+spawn happens; the binding is the only mutation.
 
 **Safety properties enforced by the binary** (you don't have to
 police these):
 
-- Refuses if `$CLAUDE_CODE_SESSION_ID` is unset (not a Claude Code
-  session) or not a v4 UUID.
+- Refuses if the selected harness session env is unset (for example,
+  not a Claude/Codex session) or not a valid harness session UUID.
 - Refuses if **THIS session** is already bound to a different task.
   `--force` does NOT override this — session_id uniqueness is
   structural. The user must release the prior binding first or
@@ -1552,17 +1553,17 @@ police these):
   session_id bound. `--force` overrides this case (and only this
   case), but the user has been told it orphans the target's
   prior session.
-- Refuses if **this Claude session's spawn directory ≠
-  `task.work_dir`**. Flow maintains the invariant *any task with
-  a session_id has work_dir equal to the cwd that session was
-  created at* — that's what makes `flow do <slug>` resumes find
-  the harness's on-disk transcript (the path is keyed by encoded
-  cwd). The check is honest: the binary stats the expected
-  transcript file on disk, not `os.Getwd()`. **`cd <work_dir>
-  && flow do --here` does NOT bypass this** — the chained `cd`
-  only changes the flow subprocess's cwd, not where the actual
-  Claude session jsonl was written. `--force` does NOT override
-  this gate — see the sub-recipe below.
+- For cwd-keyed transcript harnesses such as Claude, refuses if
+  **this session's spawn directory ≠ `task.work_dir`**. Flow
+  maintains the invariant *any task with a session_id has work_dir
+  equal to the cwd that session was created at* — that's what makes
+  `flow do <slug>` resumes find the harness's on-disk transcript.
+  The check is honest: the binary stats the expected transcript file
+  on disk, not `os.Getwd()`. **`cd <work_dir> && flow do --here`
+  does NOT bypass this** — the chained `cd` only changes the flow
+  subprocess's cwd, not where the actual harness session transcript
+  was written. `--force` does NOT override this gate — see the
+  sub-recipe below.
 - No-op (idempotent) if the target is already bound to this same
   session.
 - Refuses if the target is `done`. Reopen via
@@ -1575,11 +1576,11 @@ police these):
 When `flow do --here <slug>` exits non-zero with stderr
 containing "the harness transcript isn't where work_dir says",
 the binary stat'd the expected transcript path on disk and it
-didn't exist — meaning **the Claude session you're currently in
+didn't exist — meaning **the agent session you're currently in
 was started in a directory other than `task.work_dir`.** This is
-a fact about the running Claude process, not about your current
+a fact about the running harness process, not about your current
 Bash shell cwd. Whatever directory you `cd` into now does NOT
-change where the session jsonl was written. The binary's check
+change where the session transcript was written. The binary's check
 detects this and refuses; trying to retry from a different cwd
 won't help.
 
@@ -1591,11 +1592,11 @@ hit the same refusal:
 ```
 AskUserQuestion({
   questions: [{
-    question: "This Claude session was started in a different directory than task `<slug>`'s work_dir (<work_dir>). The session's on-disk transcript isn't where future `flow do` resumes would look. What do you want to do?",
+    question: "This agent session was started in a different directory than task `<slug>`'s work_dir (<work_dir>). The session's on-disk transcript isn't where future `flow do` resumes would look. What do you want to do?",
     header: "Cwd mismatch",
     options: [
-      { label: "Open in a new tab (Recommended)",  description: "Run `flow do <slug>` to spawn a fresh Claude session at the task's work_dir. THIS session stays unbound and keeps doing whatever it was doing. Best when you weren't really working on the task here." },
-      { label: "Point work_dir at THIS session's directory", description: "If you actually want this Claude session to own the task, update the task's work_dir to wherever this Claude was started (you'll need to figure that out — try the cwd of the shell that launched Claude). I'll then retry --here. Allowed even when a session is already bound, but the new work_dir must match where the harness transcript actually lives." }
+      { label: "Open in a new tab (Recommended)",  description: "Run `flow do <slug>` to spawn a fresh harness session at the task's work_dir. THIS session stays unbound and keeps doing whatever it was doing. Best when you weren't really working on the task here." },
+      { label: "Point work_dir at THIS session's directory", description: "If you actually want this agent session to own the task, update the task's work_dir to wherever this harness was started. I'll then retry --here. Allowed even when a session is already bound, but the new work_dir must match where the harness transcript actually lives." }
     ],
     multiSelect: false
   }]
@@ -1607,8 +1608,7 @@ THIS session stays unbound; the task gets its own new session
 at work_dir.
 
 On "Point work_dir at THIS session's directory" → ask the user
-what cwd Claude was started in (they typed `claude` from
-somewhere — that's the path). Then run
+what cwd the harness was started in. Then run
 `flow update task <slug> --work-dir <real-cwd>`, then
 `flow do --here <slug>`. The work_dir update will succeed only
 if the harness transcript is actually at the named path
@@ -1889,16 +1889,20 @@ instead.
 
 ## 9. The execution-session bootstrap contract
 
-When `flow do <task>` spawns a Claude session in a new terminal tab, it
-pre-allocates a UUID, writes it to `tasks.session_id` before spawning,
-and passes it to `claude --session-id <uuid>`. This makes the session's
-jsonl file appear at the deterministic path
-`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`. There is no
-self-registration step — the DB is authoritative from the moment the
-tab opens.
+When `flow do <task>` spawns a new terminal tab, it binds a harness
+session id in `tasks.session_id` before the interactive session is
+handed to the user. For Claude, flow pre-allocates a UUID and passes it
+to `claude --session-id <uuid>`, which writes the jsonl transcript at
+`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`. For Codex, flow first
+asks `codex exec --json` to allocate a thread, stores the emitted
+thread id, bootstraps the task with `codex exec resume <id> ...`, and
+then opens `codex resume <id>` interactively. Codex transcripts live
+under `$CODEX_HOME/sessions` or `~/.codex/sessions`.
 
-Subsequent `flow do <same-task>` calls read that UUID and spawn
-`claude --resume <uuid>` to continue the same conversation.
+There is no self-registration step — the DB is authoritative from the
+moment the session is bound. Subsequent `flow do <same-task>` calls read
+the stored id and resume through the selected harness (`claude --resume
+<uuid>` for Claude, `codex resume <id>` for Codex).
 
 **If you are the execution session spawned by `flow do`:**
 
@@ -2070,10 +2074,12 @@ surface the bug instead.
 
 ## 10. How "what task am I on?" gets answered
 
-`tasks.session_id` is the single source of truth. Every Claude Code
-session has `$CLAUDE_CODE_SESSION_ID` in its env (Claude Code injects
-it); flow's commands reverse-lookup this value against
-`tasks.session_id` to find the bound task. Two implications:
+`tasks.session_id` is the single source of truth. Each supported
+harness exposes its current session id in env (`$CLAUDE_CODE_SESSION_ID`
+for Claude, `$CODEX_THREAD_ID` for Codex); flow's commands
+reverse-lookup this value against `tasks.session_id` to find the bound
+task. If multiple harness env vars are present, pass a task ref
+explicitly or use the relevant `--harness` flag. Two implications:
 
 - `flow show task` with no argument resolves the bound task via
   reverse-lookup. So does `flow show project` (it resolves the bound
