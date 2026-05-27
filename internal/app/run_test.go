@@ -367,6 +367,32 @@ func TestCmdRunPlaybookHereInvalidUUID(t *testing.T) {
 	}
 }
 
+func TestCmdRunPlaybookHereMissingTranscriptNoRunRow(t *testing.T) {
+	setupFlowRoot(t)
+	wd := t.TempDir()
+	if rc := cmdAdd([]string{"playbook", "P", "--slug", "p", "--work-dir", wd}); rc != 0 {
+		t.Fatal()
+	}
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "f00ba111-2222-4333-8444-555555555555")
+	count, _ := stubITerm(t)
+
+	if rc := cmdRun([]string{"playbook", "p", "--here"}); rc != 1 {
+		t.Errorf("rc=%d, want 1 when transcript validation fails", rc)
+	}
+	if *count != 0 {
+		t.Errorf("no spawn expected; got %d", *count)
+	}
+
+	db := openFlowDB(t)
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE kind='playbook_run'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("no run row should be created on transcript validation failure; got %d", n)
+	}
+}
+
 // TestCmdRunPlaybookHereRejectsCurrentSessionAlreadyBoundElsewhere
 // pins the session_id uniqueness invariant: if the current session
 // is already bound to another task, --here refuses (and does NOT

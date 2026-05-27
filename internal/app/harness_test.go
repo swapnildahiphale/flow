@@ -211,6 +211,25 @@ func TestCmdDoRejectsUnknownHarnessFlag(t *testing.T) {
 	}
 }
 
+func TestCmdDoRejectsExtraTrailingArgument(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "extra-arg-task")
+	count, _ := stubITerm(t)
+
+	stderr := captureStderr(t)
+	rc := cmdDo([]string{"extra-arg-task", "--harness", "claude", "surprise"})
+	if rc != 2 {
+		t.Fatalf("cmdDo rc=%d, want 2", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "unexpected argument") {
+		t.Fatalf("stderr=%q", got)
+	}
+	if *count != 0 {
+		t.Fatalf("spawn count=%d, want 0", *count)
+	}
+}
+
 func TestCmdDoExplicitCodexFailsBeforeSessionAllocation(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "harness-codex")

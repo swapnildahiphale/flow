@@ -120,6 +120,10 @@ func cmdDo(args []string) int {
 	if err := fs.Parse(fs.Args()[1:]); err != nil {
 		return 2
 	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "error: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
 	explicitHarness, err := parseHarnessName(*harnessFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -787,9 +791,9 @@ func cmdDoHere(query string, force bool, explicit harness.Name) int {
 	priorBinding, lookupErr := flowdb.TaskBySessionID(db, sid)
 	if lookupErr == nil && priorBinding.Slug != task.Slug {
 		fmt.Fprintf(os.Stderr,
-			"error: this Claude session is already bound to task %q. binding it to %q would orphan %q's transcript and is rejected by the session_id uniqueness invariant. --force does not override this.\n"+
+			"error: this %s session is already bound to task %q. binding it to %q would orphan %q's transcript and is rejected by the session_id uniqueness invariant. --force does not override this.\n"+
 				"  to start work on %q in a separate session: flow do %s\n",
-			priorBinding.Slug, task.Slug, priorBinding.Slug, task.Slug, task.Slug)
+			h.Name(), priorBinding.Slug, task.Slug, priorBinding.Slug, task.Slug, task.Slug)
 		return 1
 	}
 
@@ -821,14 +825,14 @@ func cmdDoHere(query string, force bool, explicit harness.Name) int {
 	// no-op since its sessions are sid-only.
 	if err := h.ValidateSession(task.WorkDir, sid); err != nil {
 		fmt.Fprintf(os.Stderr,
-			"error: can't bind this session to task %q — the claude transcript isn't where work_dir says it should be:\n"+
+			"error: can't bind this session to task %q — the %s transcript isn't where work_dir says it should be:\n"+
 				"  %v\n"+
-				"this means claude was started in a different directory than task.work_dir, OR work_dir is set wrong.\n"+
+				"this means %s was started in a different directory than task.work_dir, OR work_dir is set wrong.\n"+
 				"pick one of:\n"+
 				"  - open it in a new tab (recommended):           flow do %s\n"+
-				"  - point work_dir at where claude actually runs: flow update task %s --work-dir <real-cwd>\n"+
+				"  - point work_dir at where %s actually runs: flow update task %s --work-dir <real-cwd>\n"+
 				"    (allowed because the new work_dir must match the session's real on-disk location)\n",
-			task.Slug, err, task.Slug, task.Slug)
+			task.Slug, h.Name(), err, h.Binary(), task.Slug, h.Binary(), task.Slug)
 		return 1
 	}
 

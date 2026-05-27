@@ -91,6 +91,23 @@ func cmdRunPlaybook(args []string) int {
 		return 1
 	}
 
+	// Run task's work_dir. For the default (new-tab) path that's
+	// the playbook's work_dir — we spawn a tab there. For the
+	// --here path we adopt the binding session's cwd, because the
+	// run will execute in THIS session (wherever the user has it),
+	// and the cwd==work_dir invariant the bind path enforces means
+	// they must agree. If the user wants the run at the playbook's
+	// default path, they cd there first.
+	runWorkDir := pb.WorkDir
+	if *here {
+		wd, gerr := os.Getwd()
+		if gerr != nil {
+			fmt.Fprintf(os.Stderr, "error: read cwd: %v\n", gerr)
+			return 1
+		}
+		runWorkDir = wd
+	}
+
 	// --here validation BEFORE the run-task row insert. Mirrors the
 	// pre-write checks in cmdDoHere — failing fast prevents a dangling
 	// backlog playbook_run task when env is wrong or this session is
@@ -133,12 +150,20 @@ func cmdRunPlaybook(args []string) int {
 				h.SessionIDEnvVar(), err)
 			return 1
 		}
+		if err := h.ValidateSession(runWorkDir, sid); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"error: can't bind this session to playbook run %q — the %s transcript isn't where work_dir says it should be:\n"+
+					"  %v\n"+
+					"this means %s was started in a different directory than the run work_dir, OR the work_dir is wrong.\n",
+				pb.Slug, h.Name(), err, h.Binary())
+			return 1
+		}
 		priorBinding, lookupErr := flowdb.TaskBySessionID(db, sid)
 		if lookupErr == nil {
 			fmt.Fprintf(os.Stderr,
-				"error: this Claude session is already bound to task %q. binding it to a new playbook run would orphan %q's transcript and is rejected by the session_id uniqueness invariant.\n"+
+				"error: this %s session is already bound to task %q. binding it to a new playbook run would orphan %q's transcript and is rejected by the session_id uniqueness invariant.\n"+
 					"  to start this playbook run in a separate session: flow run playbook %s\n",
-				priorBinding.Slug, priorBinding.Slug, pb.Slug)
+				h.Name(), priorBinding.Slug, priorBinding.Slug, pb.Slug)
 			return 1
 		}
 	}
@@ -159,23 +184,6 @@ func cmdRunPlaybook(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
-	}
-
-	// Run task's work_dir. For the default (new-tab) path that's
-	// the playbook's work_dir — we spawn a tab there. For the
-	// --here path we adopt the binding session's cwd, because the
-	// run will execute in THIS session (wherever the user has it),
-	// and the cwd==work_dir invariant the bind path enforces means
-	// they must agree. If the user wants the run at the playbook's
-	// default path, they cd there first.
-	runWorkDir := pb.WorkDir
-	if *here {
-		wd, gerr := os.Getwd()
-		if gerr != nil {
-			fmt.Fprintf(os.Stderr, "error: read cwd: %v\n", gerr)
-			return 1
-		}
-		runWorkDir = wd
 	}
 
 	// Insert the run-task row.
