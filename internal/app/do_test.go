@@ -721,6 +721,56 @@ func TestCmdDoResumeUsesWorkDirAfterTransactionReread(t *testing.T) {
 	}
 }
 
+func TestCmdDoResumeSessionChangedDuringLiveCheckRefuses(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "resume-binding-race")
+	spawns, _ := stubITerm(t)
+
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, session_started=?, harness=?, updated_at=? WHERE slug='resume-binding-race'`,
+		"old-session", flowdb.NowISO(), "claude", flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	oldPSRunner := claude.PSRunner
+	var mutated int64
+	claude.PSRunner = func() ([]byte, error) {
+		if atomic.CompareAndSwapInt64(&mutated, 0, 1) {
+			if _, err := db.Exec(
+				`UPDATE tasks SET session_id=?, harness=?, updated_at=? WHERE slug='resume-binding-race'`,
+				"new-session", "codex", flowdb.NowISO(),
+			); err != nil {
+				t.Fatalf("concurrent session rebind: %v", err)
+			}
+		}
+		return []byte("  PID COMMAND\n"), nil
+	}
+	t.Cleanup(func() { claude.PSRunner = oldPSRunner })
+
+	if rc := cmdDo([]string{"resume-binding-race"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(&mutated); got != 1 {
+		t.Fatalf("PSRunner mutation count=%d, want 1", got)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+
+	task, err := flowdb.GetTask(db, "resume-binding-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.SessionID.Valid || task.SessionID.String != "new-session" {
+		t.Fatalf("session_id=%+v, want new-session", task.SessionID)
+	}
+	if !task.Harness.Valid || task.Harness.String != "codex" {
+		t.Fatalf("harness=%+v, want codex", task.Harness)
+	}
+}
+
 func TestCmdDoResumeArchivedDuringLiveCheckRefuses(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "resume-archive-race")

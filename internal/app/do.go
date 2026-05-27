@@ -277,9 +277,9 @@ func cmdDo(args []string) int {
 	// Fresh bootstrap means: either the task has no session_id, or --fresh
 	// was passed. In both cases we use the session prepared before the
 	// transaction and claim it in the DB via the status-flip UPDATE below.
-	var curSessionID sql.NullString
-	if err := tx.QueryRow(`SELECT session_id FROM tasks WHERE slug=?`, task.Slug).Scan(&curSessionID); err != nil {
-		fmt.Fprintf(os.Stderr, "error: re-read session_id: %v\n", err)
+	var curSessionID, curHarness sql.NullString
+	if err := tx.QueryRow(`SELECT session_id, harness FROM tasks WHERE slug=?`, task.Slug).Scan(&curSessionID, &curHarness); err != nil {
+		fmt.Fprintf(os.Stderr, "error: re-read session binding: %v\n", err)
 		return 1
 	}
 	needsBootstrap := !hasSessionID(curSessionID) || *fresh
@@ -294,6 +294,10 @@ func cmdDo(args []string) int {
 	} else if needsBootstrap {
 		sessionID = prepared.SessionID
 	} else {
+		if curSessionID.String != expectedSessionID || nullStringValue(curHarness) != expectedHarness {
+			fmt.Fprintf(os.Stderr, "error: task %q session changed while preparing; retry flow do\n", task.Slug)
+			return 1
+		}
 		sessionID = curSessionID.String
 	}
 
@@ -355,8 +359,10 @@ func cmdDo(args []string) int {
 			 status_changed_at = CASE WHEN status != 'in-progress' THEN ? ELSE status_changed_at END,
 			 updated_at=?
 			 WHERE slug=? AND `+statusFilter+`
-			   AND archived_at IS NULL`,
-			now, now, task.Slug,
+			   AND archived_at IS NULL
+			   AND ((? = '' AND (session_id IS NULL OR session_id = '')) OR session_id = ?)
+			   AND ((? = '' AND (harness IS NULL OR harness = '')) OR harness = ?)`,
+			now, now, task.Slug, expectedSessionID, expectedSessionID, expectedHarness, expectedHarness,
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: flip status: %v\n", err)
@@ -476,6 +482,13 @@ func cmdDo(args []string) int {
 
 func hasSessionID(id sql.NullString) bool {
 	return id.Valid && id.String != ""
+}
+
+func nullStringValue(s sql.NullString) string {
+	if !s.Valid {
+		return ""
+	}
+	return s.String
 }
 
 func rollbackFreshSessionBind(db *sql.DB, slug, sessionID, sessionStarted, priorHarness, boundHarness string) {
