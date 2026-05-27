@@ -390,6 +390,9 @@ func TestCmdDoFreshSpawnFailureRollsBackSessionID(t *testing.T) {
 	if task.Status != "backlog" {
 		t.Errorf("status after spawn failure: got %q, want backlog (full rollback)", task.Status)
 	}
+	if task.Harness.Valid && task.Harness.String != "" {
+		t.Errorf("harness should be cleared after spawn failure rollback; got %q", task.Harness.String)
+	}
 }
 
 func TestCmdDoFreshDoneTaskRefusesBeforePrepare(t *testing.T) {
@@ -718,6 +721,56 @@ func TestCmdDoResumeUsesWorkDirAfterTransactionReread(t *testing.T) {
 	}
 }
 
+func TestCmdDoResumeArchivedDuringLiveCheckRefuses(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "resume-archive-race")
+	spawns, _ := stubITerm(t)
+
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, session_started=?, updated_at=? WHERE slug='resume-archive-race'`,
+		"existing-session", flowdb.NowISO(), flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	oldPSRunner := claude.PSRunner
+	var mutated int64
+	claude.PSRunner = func() ([]byte, error) {
+		if atomic.CompareAndSwapInt64(&mutated, 0, 1) {
+			if _, err := db.Exec(
+				`UPDATE tasks SET archived_at=?, updated_at=? WHERE slug='resume-archive-race'`,
+				flowdb.NowISO(), flowdb.NowISO(),
+			); err != nil {
+				t.Fatalf("concurrent archive: %v", err)
+			}
+		}
+		return []byte("  PID COMMAND\n"), nil
+	}
+	t.Cleanup(func() { claude.PSRunner = oldPSRunner })
+
+	if rc := cmdDo([]string{"resume-archive-race"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(&mutated); got != 1 {
+		t.Fatalf("PSRunner mutation count=%d, want 1", got)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+
+	task, err := flowdb.GetTask(db, "resume-archive-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.ArchivedAt.Valid {
+		t.Fatal("archived_at should preserve concurrent archive")
+	}
+	if task.Status != "backlog" {
+		t.Fatalf("status=%q, want backlog", task.Status)
+	}
+}
+
 func TestCmdDoFreshArchivedDuringPrepareRefuses(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "fresh-archive-race")
@@ -841,6 +894,39 @@ func TestCmdDoFreshRollbackDoesNotClobberConcurrentStatusChange(t *testing.T) {
 	}
 	if !task.SessionStarted.Valid {
 		t.Fatal("session_started should remain set")
+	}
+}
+
+func TestCmdDoEmptyStringSessionIDBootstrapsFresh(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "empty-session-id")
+	const pinnedSID = "44444444-5555-4666-8777-888888888888"
+	stubNewUUID(t, pinnedSID)
+	_, getScript := stubITerm(t)
+
+	db := openFlowDB(t)
+	if _, err := db.Exec(`UPDATE tasks SET session_id='' WHERE slug='empty-session-id'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc := cmdDo([]string{"empty-session-id"}); rc != 0 {
+		t.Fatalf("cmdDo rc=%d, want 0", rc)
+	}
+
+	script := getScript()
+	if strings.Contains(script, "--resume") {
+		t.Fatalf("empty session_id should not use resume path: %s", script)
+	}
+	if !strings.Contains(script, "--session-id "+pinnedSID) {
+		t.Fatalf("empty session_id should bootstrap fresh with %s: %s", pinnedSID, script)
+	}
+
+	task, err := flowdb.GetTask(db, "empty-session-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.SessionID.Valid || task.SessionID.String != pinnedSID {
+		t.Fatalf("session_id=%+v, want %s", task.SessionID, pinnedSID)
 	}
 }
 

@@ -180,7 +180,7 @@ func cmdDo(args []string) int {
 	}
 	sessionCtx := harness.SessionContext{WorkDir: task.WorkDir, Env: os.Environ()}
 	expectedSessionID := ""
-	if task.SessionID.Valid {
+	if hasSessionID(task.SessionID) {
 		expectedSessionID = task.SessionID.String
 	}
 	expectedHarness := ""
@@ -221,7 +221,7 @@ func cmdDo(args []string) int {
 
 	var prompt string
 	var prepared harness.PreparedSession
-	snapshotNeedsBootstrap := !task.SessionID.Valid || *fresh
+	snapshotNeedsBootstrap := !hasSessionID(task.SessionID) || *fresh
 	if snapshotNeedsBootstrap {
 		if task.WorkDir == "" {
 			fmt.Fprintf(os.Stderr, "error: task %q has no work_dir\n", task.Slug)
@@ -282,7 +282,7 @@ func cmdDo(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: re-read session_id: %v\n", err)
 		return 1
 	}
-	needsBootstrap := !curSessionID.Valid || *fresh
+	needsBootstrap := !hasSessionID(curSessionID) || *fresh
 	var sessionID string
 	if needsBootstrap && !snapshotNeedsBootstrap {
 		fmt.Fprintf(os.Stderr, "error: task %q session changed while preparing; retry flow do\n", task.Slug)
@@ -336,7 +336,7 @@ func cmdDo(args []string) int {
 				   AND ((? = '' AND playbook_slug IS NULL) OR playbook_slug = ?)
 				   AND ((? = '' AND (harness IS NULL OR harness = '')) OR harness = ?)
 				   AND updated_at=?
-				   AND ((? = '' AND session_id IS NULL) OR session_id = ?)`,
+				   AND ((? = '' AND (session_id IS NULL OR session_id = '')) OR session_id = ?)`,
 			now, sessionID, now, string(h.Name()), now, task.Slug,
 			task.WorkDir, task.Kind, expectedPlaybookSlug, expectedPlaybookSlug,
 			expectedHarness, expectedHarness, task.UpdatedAt, expectedSessionID, expectedSessionID,
@@ -350,14 +350,20 @@ func cmdDo(args []string) int {
 			return 1
 		}
 	} else {
-		if _, err := tx.Exec(
+		res, err := tx.Exec(
 			`UPDATE tasks SET status='in-progress',
 			 status_changed_at = CASE WHEN status != 'in-progress' THEN ? ELSE status_changed_at END,
 			 updated_at=?
-			 WHERE slug=? AND `+statusFilter,
+			 WHERE slug=? AND `+statusFilter+`
+			   AND archived_at IS NULL`,
 			now, now, task.Slug,
-		); err != nil {
+		)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: flip status: %v\n", err)
+			return 1
+		}
+		if affected, _ := res.RowsAffected(); affected == 0 {
+			fmt.Fprintf(os.Stderr, "error: task %q changed concurrently; retry flow do\n", task.Slug)
 			return 1
 		}
 	}
@@ -375,7 +381,7 @@ func cmdDo(args []string) int {
 	}
 	committed = true
 
-	if *fresh && curSessionID.Valid {
+	if *fresh && hasSessionID(curSessionID) {
 		fmt.Printf("--fresh: discarding old session %s\n", curSessionID.String)
 	}
 	if task.WorkDir == "" {
@@ -403,7 +409,7 @@ func cmdDo(args []string) int {
 	var command string
 	if needsBootstrap {
 		if err := h.BootstrapFreshSession(sessionCtx, sessionID, prompt, launchOpts); err != nil {
-			rollbackFreshSessionBind(db, task.Slug, sessionID, sessionStarted)
+			rollbackFreshSessionBind(db, task.Slug, sessionID, sessionStarted, expectedHarness, string(h.Name()))
 			fmt.Fprintf(os.Stderr, "error: bootstrap session: %v\n", err)
 			return 1
 		}
@@ -425,17 +431,18 @@ func cmdDo(args []string) int {
 	if err := spawner.SpawnTab(buildTabTitle(project, task), task.WorkDir, command, spawnEnv); err != nil {
 		if needsBootstrap {
 			// Spawn failed after the fresh bind. Undo both the
-			// session_id pre-allocation AND the status flip so the
-			// next `flow do` retries bootstrap fresh. The
-			// session-id invariant (in-progress requires session_id)
-			// makes "preserve status, drop session_id" illegal —
-			// rolling status back to backlog is the only consistent
-			// recovery. The user's next `flow do` will flip fresh.
+			// session_id pre-allocation, harness pin, and status
+			// flip so the next `flow do` retries bootstrap fresh.
+			// The session-id invariant (in-progress requires
+			// session_id) makes "preserve status, drop session_id"
+			// illegal — rolling status back to backlog is the only
+			// consistent recovery. The user's next `flow do` will
+			// flip fresh.
 			//
 			// The WHERE clause guards against a concurrent `flow do`
 			// having mutated session_id between commit and now —
 			// only roll back if we still own the session.
-			rollbackFreshSessionBind(db, task.Slug, sessionID, sessionStarted)
+			rollbackFreshSessionBind(db, task.Slug, sessionID, sessionStarted, expectedHarness, string(h.Name()))
 		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -467,19 +474,25 @@ func cmdDo(args []string) int {
 	return 0
 }
 
-func rollbackFreshSessionBind(db *sql.DB, slug, sessionID, sessionStarted string) {
+func hasSessionID(id sql.NullString) bool {
+	return id.Valid && id.String != ""
+}
+
+func rollbackFreshSessionBind(db *sql.DB, slug, sessionID, sessionStarted, priorHarness, boundHarness string) {
 	res, err := db.Exec(
 		`UPDATE tasks SET
 			session_id        = NULL,
 			session_started   = NULL,
 			status            = 'backlog',
 			status_changed_at = NULL,
+			harness           = CASE WHEN ? = '' THEN NULL ELSE ? END,
 			updated_at        = ?
 		 WHERE slug=?
 		   AND session_id=?
 		   AND status='in-progress'
-		   AND session_started=?`,
-		flowdb.NowISO(), slug, sessionID, sessionStarted,
+		   AND session_started=?
+		   AND harness=?`,
+		priorHarness, priorHarness, flowdb.NowISO(), slug, sessionID, sessionStarted, boundHarness,
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: rollback fresh session bind: %v\n", err)
