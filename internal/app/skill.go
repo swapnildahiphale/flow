@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"flow/internal/harness"
 )
 
 //go:embed skill/SKILL.md
@@ -17,16 +19,22 @@ var embeddedSkill []byte
 // orphan existing installations.
 const hookCommand = "flow hook session-start"
 
+const codexHookCommand = "flow hook session-start --harness codex"
+
 // userPromptSubmitHookCommand is the legacy UserPromptSubmit hook
 // string. flow no longer installs this hook (removed in
 // v0.1.0-alpha.7), but every install/upgrade actively uninstalls
 // stale entries so existing-user setups converge to a clean state.
 const userPromptSubmitHookCommand = "flow hook user-prompt-submit"
 
+type sessionStartHookWarner interface {
+	SessionStartHookWarning() string
+}
+
 // readSkillVersion returns the version string recorded in the
 // harness's skill-version sidecar, or "" if missing/unreadable.
-func readSkillVersion() string {
-	p, err := defaultHarness().SkillVersionPath()
+func readSkillVersionForHarness(h harness.Harness) string {
+	p, err := h.SkillVersionPath()
 	if err != nil {
 		return ""
 	}
@@ -37,12 +45,16 @@ func readSkillVersion() string {
 	return strings.TrimSpace(string(b))
 }
 
+func readSkillVersion() string {
+	return readSkillVersionForHarness(defaultHarness())
+}
+
 // writeSkillVersion records `v` as the version of the binary that
 // installed the current skill content. Errors are non-fatal —
 // failing to write the sidecar should never block a successful
 // skill install.
-func writeSkillVersion(v string) error {
-	p, err := defaultHarness().SkillVersionPath()
+func writeSkillVersionForHarness(h harness.Harness, v string) error {
+	p, err := h.SkillVersionPath()
 	if err != nil {
 		return err
 	}
@@ -50,6 +62,34 @@ func writeSkillVersion(v string) error {
 		return err
 	}
 	return os.WriteFile(p, []byte(v+"\n"), 0o644)
+}
+
+func writeSkillVersion(v string) error {
+	return writeSkillVersionForHarness(defaultHarness(), v)
+}
+
+func hookCommandForHarness(h harness.Harness) string {
+	if h.Name() == harness.NameCodex {
+		return codexHookCommand
+	}
+	return hookCommand
+}
+
+func selectedHarnesses(raw string) ([]harness.Harness, error) {
+	switch raw {
+	case "", "auto":
+		return []harness.Harness{defaultHarness()}, nil
+	case "all":
+		return allHarnesses(), nil
+	case string(harness.NameClaude), string(harness.NameCodex):
+		h, err := harnessByName(raw)
+		if err != nil {
+			return nil, err
+		}
+		return []harness.Harness{h}, nil
+	default:
+		return nil, fmt.Errorf("unknown harness %q (want auto, claude, codex, or all)", raw)
+	}
 }
 
 // maybeAutoUpgradeSkill checks the recorded skill version against the
@@ -71,29 +111,30 @@ func maybeAutoUpgradeSkill() {
 	if Version == "" || Version == "dev" {
 		return
 	}
-	h := defaultHarness()
-	skillPath, err := h.SkillInstallPath()
-	if err != nil {
-		return
+	for _, h := range allHarnesses() {
+		skillPath, err := h.SkillInstallPath()
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(skillPath); err != nil {
+			// Not installed → user opted out; don't reinstall behind their back.
+			continue
+		}
+		if readSkillVersionForHarness(h) == Version {
+			continue
+		}
+		// Version mismatch — refresh skill bytes and the SessionStart hook.
+		if err := h.InstallSkill(embeddedSkill); err != nil {
+			continue
+		}
+		_ = writeSkillVersionForHarness(h, Version)
+		_, _ = h.InstallSessionStartHook(hookCommandForHarness(h))
+		// UserPromptSubmit hook was removed in v0.1.0-alpha.7 — the
+		// per-prompt token cost wasn't worth the marginal value. Actively
+		// uninstall any stale entry left behind by older binaries.
+		_, _ = h.UninstallUserPromptSubmitHook(userPromptSubmitHookCommand)
+		fmt.Fprintf(os.Stderr, "flow: upgraded %s skill to %s\n", h.Name(), Version)
 	}
-	if _, err := os.Stat(skillPath); err != nil {
-		// Not installed → user opted out; don't reinstall behind their back.
-		return
-	}
-	if readSkillVersion() == Version {
-		return
-	}
-	// Version mismatch — refresh skill bytes and the SessionStart hook.
-	if err := h.InstallSkill(embeddedSkill); err != nil {
-		return
-	}
-	_ = writeSkillVersion(Version)
-	_, _ = h.InstallSessionStartHook(hookCommand)
-	// UserPromptSubmit hook was removed in v0.1.0-alpha.7 — the
-	// per-prompt token cost wasn't worth the marginal value. Actively
-	// uninstall any stale entry left behind by older binaries.
-	_, _ = h.UninstallUserPromptSubmitHook(userPromptSubmitHookCommand)
-	fmt.Fprintf(os.Stderr, "flow: upgraded skill to %s\n", Version)
 }
 
 // cmdSkill dispatches `flow skill install|uninstall|update`.
@@ -120,17 +161,32 @@ func skillInstall(args []string, forceDefault bool) int {
 	fs := flagSet("skill install")
 	force := fs.Bool("force", forceDefault, "overwrite an existing installation")
 	skipHook := fs.Bool("skip-hook", false, "don't auto-install the SessionStart hook")
+	harnessFlag := fs.String("harness", "auto", "target harness: auto, claude, codex, or all")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	h := defaultHarness()
+	hs, err := selectedHarnesses(*harnessFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
+	rc := 0
+	for _, h := range hs {
+		if installSkillForHarness(h, *force, *skipHook) != 0 {
+			rc = 1
+		}
+	}
+	return rc
+}
+
+func installSkillForHarness(h harness.Harness, force, skipHook bool) int {
 	dest, err := h.SkillInstallPath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	if _, err := os.Stat(dest); err == nil && !*force {
+	if _, err := os.Stat(dest); err == nil && !force {
 		fmt.Fprintf(os.Stderr, "error: %s already exists; use --force to overwrite\n", dest)
 		return 1
 	} else if err != nil && !os.IsNotExist(err) {
@@ -141,16 +197,16 @@ func skillInstall(args []string, forceDefault bool) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	if err := writeSkillVersion(Version); err != nil {
+	if err := writeSkillVersionForHarness(h, Version); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not record skill version: %v\n", err)
 	}
 	fmt.Printf("installed flow skill to %s\n", dest)
 
-	if *skipHook {
+	if skipHook {
 		fmt.Println("--skip-hook: leaving harness settings alone")
 		return 0
 	}
-	if added, err := h.InstallSessionStartHook(hookCommand); err != nil {
+	if added, err := h.InstallSessionStartHook(hookCommandForHarness(h)); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not install SessionStart hook: %v\n", err)
 		// Non-fatal: the skill is still usable without the hook; the
 		// user can wire it manually. Return 0 so `flow init` doesn't
@@ -160,6 +216,11 @@ func skillInstall(args []string, forceDefault bool) int {
 		fmt.Printf("installed SessionStart hook (fires on startup + resume)\n")
 	} else {
 		fmt.Println("SessionStart hook already installed — leaving as is")
+	}
+	if warner, ok := h.(sessionStartHookWarner); ok {
+		if msg := warner.SessionStartHookWarning(); msg != "" {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
+		}
 	}
 	// UserPromptSubmit hook was removed in v0.1.0-alpha.7. Actively
 	// uninstall any stale entry left behind by older binaries so a
@@ -176,10 +237,25 @@ func skillInstall(args []string, forceDefault bool) int {
 func skillUninstall(args []string) int {
 	fs := flagSet("skill uninstall")
 	keepHook := fs.Bool("keep-hook", false, "don't remove the SessionStart hook")
+	harnessFlag := fs.String("harness", "auto", "target harness: auto, claude, codex, or all")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	h := defaultHarness()
+	hs, err := selectedHarnesses(*harnessFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
+	rc := 0
+	for _, h := range hs {
+		if uninstallSkillForHarness(h, *keepHook) != 0 {
+			rc = 1
+		}
+	}
+	return rc
+}
+
+func uninstallSkillForHarness(h harness.Harness, keepHook bool) int {
 	dest, err := h.SkillInstallPath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -196,11 +272,11 @@ func skillUninstall(args []string) int {
 		fmt.Printf("uninstalled flow skill from %s\n", skillDir)
 	}
 
-	if *keepHook {
+	if keepHook {
 		fmt.Println("--keep-hook: leaving SessionStart hook in place")
 		return 0
 	}
-	if removed, err := h.UninstallSessionStartHook(hookCommand); err != nil {
+	if removed, err := h.UninstallSessionStartHook(hookCommandForHarness(h)); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not remove SessionStart hook: %v\n", err)
 		return 0
 	} else if removed {

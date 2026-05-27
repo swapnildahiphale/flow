@@ -1,7 +1,7 @@
 ---
 name: flow
 description: |
-  Personal task and Claude session manager. CLI binary is `flow` (assumed
+  Personal task and agent session manager. CLI binary is `flow` (assumed
   on PATH) and stores metadata in ~/.flow/flow.db (SQLite). Use this skill when the
   user asks about their work, tasks, or projects in any natural phrasing —
   including but not limited to: "what's left", "what's remaining",
@@ -17,7 +17,7 @@ description: |
   on", "blocked on", "stuck until", "mark done", "archive", "weekly
   review", "clean up my tasks", or when the user invokes any
   `flow <subcommand>` directly. Also use whenever the user asks you to
-  bootstrap a new Claude session on a task or tell them about their
+  bootstrap a new agent session on a task or tell them about their
   in-flight work.
 ---
 
@@ -26,16 +26,16 @@ description: |
 ## 1. What flow is
 
 `flow` is a small CLI (assumed on `$PATH`) that the user uses to track
-personal work and bootstrap per-task Claude sessions. Metadata (projects,
+personal work and bootstrap per-task agent sessions. Metadata (projects,
 tasks, workdirs, session IDs) lives in a single SQLite database at
 `~/.flow/flow.db`. Free-form plan content lives on disk as markdown
 "briefs" at `~/.flow/projects/<slug>/brief.md` and
 `~/.flow/tasks/<slug>/brief.md`. Progress notes accumulate as dated
 markdown files under each entity's `updates/` subdirectory. The user runs
-one long-lived Claude session per task in its own terminal tab, resumed via
+one long-lived agent session per task in its own terminal tab, resumed via
 `flow do <task>`.
 
-You are speaking inside one of those Claude sessions (or the user's
+You are speaking inside one of those agent sessions (or the user's
 ambient "dispatch" session). Your job is to interpret the user's natural
 language requests and turn them into the exact `flow` commands and file
 edits they imply. You never edit `flow.db` directly. You never solve
@@ -63,7 +63,7 @@ first; let them choose what happens next.
 
 1. In 2–3 sentences, describe what you can do for the user with
    flow under the hood — capture work as briefs, log progress
-   notes, resume Claude sessions across days, track what they're
+   notes, resume agent sessions across days, track what they're
    waiting on. Frame it as your capabilities, not commands. The
    user does not need to learn flow's CLI.
 2. Use `AskUserQuestion` (header: "What now?") to offer the main
@@ -92,7 +92,7 @@ an intent, follow the matching recipe instead of re-asking via §1a.
   `~/.flow/tasks/<slug>/workspace/` for floating tasks), a priority, a
   status (`backlog`, `in-progress`, `done`), an optional `project_slug`,
   an optional `waiting_on` freeform note, and a `brief.md`. Tasks also
-  carry a Claude `session_id` once `flow do` has bootstrapped a session
+  carry a harness `session_id` once `flow do` has bootstrapped a session
   for them.
 - **Playbooks** are reusable, runnable definitions. A playbook has a
   name, slug, work_dir, optional `project_slug`, and a `brief.md` that
@@ -148,13 +148,13 @@ basics in this order:
    `AskUserQuestion` (header: "Open it now?", options:
    "Open it now" / "Later, just save") to ask whether to run
    `flow do <slug>`. Briefly explain in the question: a dedicated
-   Claude session gets the brief, updates, and repo conventions
+   agent session gets the brief, updates, and repo conventions
    automatically. If "Open it now", proceed to §4.4. If "Later",
    stop here.
 
 4. **Mention the knowledge base.** "As we work together, I'll
    automatically note durable facts about you and your org in
-   `~/.flow/kb/`. These notes carry across sessions so future Claude
+   `~/.flow/kb/`. These notes carry across sessions so future agent
    conversations have context without you repeating yourself."
 
 5. **Point to daily use.** "From any session, just say 'what should I
@@ -185,19 +185,23 @@ Create
   flow add playbook "<name>" --work-dir <path> [--slug <s>] [--project <slug>] [--mkdir]
 
 Sessions
-  flow do               <ref> [--fresh] [--dangerously-skip-permissions] [--force]
+  flow do               <ref> [--fresh] [--harness auto|claude|codex]
+                              [--dangerously-skip-permissions] [--force]
                               [--with "<instruction>" | --with-file <path>]
-  flow do --here        <ref> [--force]   (bind THIS Claude session to the task — no new tab)
+  flow do --here        <ref> [--harness auto|claude|codex] [--force]
+                              (bind THIS harness session to the task — no new tab)
   flow done             <ref>
 
 Playbook runs
-  flow run playbook <slug> [--with "<instr>" | --with-file <path>]
+  flow run playbook <slug> [--harness auto|claude|codex]
+                                    [--with "<instr>" | --with-file <path>]
                                     spawn a fresh run session (new task with kind=playbook_run)
-  flow run playbook <slug> --here   bind THIS Claude session to the new run (no new tab)
+  flow run playbook <slug> --here [--harness auto|claude|codex]
+                                    bind THIS harness session to the new run (no new tab)
   flow list runs [<playbook-slug>]  list playbook runs (filter by playbook optional)
 
 Read
-  flow show task    [<ref>]     (no arg → reverse-lookup via $CLAUDE_CODE_SESSION_ID)
+  flow show task    [<ref>]     (no arg → reverse-lookup via harness session env)
   flow show project [<ref>]     (no arg → project of the bound task)
   flow show playbook    [<ref>]
   flow transcript   [<ref>] [--compact]    (readable transcript from session jsonl)
@@ -225,6 +229,14 @@ Workdirs
   flow workdir remove <path>
   flow workdir scan [<root>] [--add]
 ```
+
+### Codex harness
+
+- Start a Codex-backed task from a normal terminal with `flow do --harness codex <task>`.
+- Bind the current Codex session with `flow do --here --harness codex <task>`.
+- Codex exposes the current thread as `$CODEX_THREAD_ID`; Claude exposes `$CLAUDE_CODE_SESSION_ID`.
+- The Codex skill installs at `~/.agents/skills/flow/SKILL.md`.
+- After installing the Codex hook, review Codex `/hooks` if Codex asks whether to trust the hook.
 
 All references (`<ref>`) resolve by **exact slug match only**. There is
 no fuzzy or substring matching. Use `--slug` to pick a short, memorable

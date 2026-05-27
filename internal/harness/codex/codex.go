@@ -24,9 +24,15 @@ var (
 	CommandRunner Runner = runCodex
 	PSRunner             = runPS
 	UserHomeDir          = os.UserHomeDir
+	ReadFile             = os.ReadFile
+	WriteFile            = os.WriteFile
+	MkdirAll             = os.MkdirAll
+	RemoveAll            = os.RemoveAll
 )
 
 const allocationPrompt = "Initialize a new flow-managed Codex thread. Do not inspect files, run commands, or modify anything. Reply exactly: flow session allocated."
+const hookMatcher = "startup|resume|clear|compact"
+const hookDisabledWarning = "Codex hooks may be disabled; review ~/.codex/config.toml and Codex /hooks"
 
 func New() harness.Harness {
 	return &codex{}
@@ -244,10 +250,10 @@ func (c *codex) InstallSkill(content []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", filepath.Dir(p), err)
 	}
-	if err := os.WriteFile(p, content, 0o644); err != nil {
+	if err := WriteFile(p, content, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", p, err)
 	}
 	return nil
@@ -262,17 +268,226 @@ func (c *codex) UninstallSkill() error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		return nil
 	}
-	return os.RemoveAll(dir)
+	return RemoveAll(dir)
 }
 
 func (c *codex) InstallSessionStartHook(command string) (bool, error) {
-	return false, fmt.Errorf("codex hook install is not wired yet")
+	return mutateHook(command, "SessionStart", true)
 }
 
 func (c *codex) UninstallSessionStartHook(command string) (bool, error) {
-	return false, fmt.Errorf("codex hook uninstall is not wired yet")
+	return mutateHook(command, "SessionStart", false)
 }
 
 func (c *codex) UninstallUserPromptSubmitHook(command string) (bool, error) {
-	return false, fmt.Errorf("codex hook uninstall is not wired yet")
+	return false, nil
+}
+
+func (c *codex) SessionStartHookWarning() string {
+	home, err := codexHome()
+	if err != nil {
+		return ""
+	}
+	raw, err := ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimSpace(line)
+		for _, key := range []string{"hooks", "codex_hooks"} {
+			if strings.HasPrefix(line, key) {
+				rest := strings.TrimSpace(strings.TrimPrefix(line, key))
+				if strings.HasPrefix(rest, "=") && strings.TrimSpace(strings.TrimPrefix(rest, "=")) == "false" {
+					return hookDisabledWarning
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func codexHome() (string, error) {
+	if home := os.Getenv("CODEX_HOME"); home != "" {
+		return home, nil
+	}
+	home, err := UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("no home dir: %w", err)
+	}
+	return filepath.Join(home, ".codex"), nil
+}
+
+func hooksPath() (string, error) {
+	home, err := codexHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "hooks.json"), nil
+}
+
+func mutateHook(command, event string, install bool) (bool, error) {
+	path, err := hooksPath()
+	if err != nil {
+		return false, err
+	}
+	raw, err := ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return false, fmt.Errorf("read %s: %w", path, err)
+		}
+		raw = []byte("{}")
+		if install {
+			if err := MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return false, fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+			}
+		} else {
+			return false, nil
+		}
+	}
+
+	var file map[string]any
+	if err := json.Unmarshal(raw, &file); err != nil {
+		return false, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if file == nil {
+		file = map[string]any{}
+	}
+	hooks, _ := file["hooks"].(map[string]any)
+	if hooks == nil {
+		hooks = map[string]any{}
+	}
+	entries, _ := hooks[event].([]any)
+
+	changed := false
+	if install && hasCanonicalHookCommand(entries, command) && countHookCommands(entries, command) == 1 {
+		return false, nil
+	}
+	entries, removed := removeHookCommand(entries, command)
+	if removed {
+		changed = true
+	}
+	if install {
+		entries = append(entries, map[string]any{
+			"matcher": hookMatcher,
+			"hooks": []any{
+				map[string]any{
+					"type":    "command",
+					"command": command,
+					"timeout": float64(10),
+				},
+			},
+		})
+		changed = true
+	}
+
+	if !changed {
+		return false, nil
+	}
+	if len(entries) == 0 {
+		delete(hooks, event)
+	} else {
+		hooks[event] = entries
+	}
+	if len(hooks) == 0 {
+		delete(file, "hooks")
+	} else {
+		file["hooks"] = hooks
+	}
+
+	out, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return false, fmt.Errorf("marshal hooks: %w", err)
+	}
+	out = append(out, '\n')
+	if err := WriteFile(path, out, 0o644); err != nil {
+		return false, fmt.Errorf("write %s: %w", path, err)
+	}
+	return true, nil
+}
+
+func removeHookCommand(entries []any, command string) ([]any, bool) {
+	changed := false
+	kept := make([]any, 0, len(entries))
+	for _, entry := range entries {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			kept = append(kept, entry)
+			continue
+		}
+		inner, _ := m["hooks"].([]any)
+		filtered := make([]any, 0, len(inner))
+		for _, h := range inner {
+			hm, ok := h.(map[string]any)
+			if !ok {
+				filtered = append(filtered, h)
+				continue
+			}
+			if cmd, _ := hm["command"].(string); strings.TrimSpace(cmd) == command {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, h)
+		}
+		if len(filtered) == 0 {
+			changed = true
+			continue
+		}
+		m["hooks"] = filtered
+		kept = append(kept, m)
+	}
+	return kept, changed
+}
+
+func hasCanonicalHookCommand(entries []any, command string) bool {
+	for _, entry := range entries {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if matcher, _ := m["matcher"].(string); matcher != hookMatcher {
+			continue
+		}
+		inner, _ := m["hooks"].([]any)
+		if len(inner) != 1 {
+			continue
+		}
+		hm, ok := inner[0].(map[string]any)
+		if !ok {
+			continue
+		}
+		if typ, _ := hm["type"].(string); typ != "command" {
+			continue
+		}
+		if cmd, _ := hm["command"].(string); strings.TrimSpace(cmd) != command {
+			continue
+		}
+		if timeout, ok := hm["timeout"].(float64); ok && timeout == 10 {
+			return true
+		}
+	}
+	return false
+}
+
+func countHookCommands(entries []any, command string) int {
+	count := 0
+	for _, entry := range entries {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		inner, _ := m["hooks"].([]any)
+		for _, h := range inner {
+			hm, ok := h.(map[string]any)
+			if !ok {
+				continue
+			}
+			if cmd, _ := hm["command"].(string); strings.TrimSpace(cmd) == command {
+				count++
+			}
+		}
+	}
+	return count
 }

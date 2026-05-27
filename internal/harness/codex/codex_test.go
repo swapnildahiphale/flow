@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -369,19 +370,207 @@ func TestSkillInstallUninstallPaths(t *testing.T) {
 	}
 }
 
-func TestHooksAndTranscriptUnsupportedForNow(t *testing.T) {
+func TestCodexInstallSessionStartHookCreatesHooksJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
+
 	h := New()
-	if added, err := h.InstallSessionStartHook("flow hook session-start"); err == nil || added || !strings.Contains(err.Error(), "not wired yet") {
-		t.Fatalf("InstallSessionStartHook=(%v,%v), want unsupported", added, err)
+	added, err := h.InstallSessionStartHook("flow hook session-start --harness codex")
+	if err != nil {
+		t.Fatalf("InstallSessionStartHook: %v", err)
 	}
-	if removed, err := h.UninstallSessionStartHook("flow hook session-start"); err == nil || removed || !strings.Contains(err.Error(), "not wired yet") {
-		t.Fatalf("UninstallSessionStartHook=(%v,%v), want unsupported", removed, err)
+	if !added {
+		t.Fatal("InstallSessionStartHook added=false, want true")
 	}
-	if removed, err := h.UninstallUserPromptSubmitHook("flow hook user-prompt-submit"); err == nil || removed || !strings.Contains(err.Error(), "not wired yet") {
-		t.Fatalf("UninstallUserPromptSubmitHook=(%v,%v), want unsupported", removed, err)
+
+	raw, err := os.ReadFile(filepath.Join(home, "codex-home", "hooks.json"))
+	if err != nil {
+		t.Fatalf("read hooks.json: %v", err)
 	}
+	var hooks map[string]any
+	if err := json.Unmarshal(raw, &hooks); err != nil {
+		t.Fatalf("parse hooks.json: %v\n%s", err, raw)
+	}
+	entries := hooks["hooks"].(map[string]any)["SessionStart"].([]any)
+	if got := countCodexHookCommands(entries, "flow hook session-start --harness codex"); got != 1 {
+		t.Fatalf("matching SessionStart hooks=%d, want 1; entries=%#v", got, entries)
+	}
+	entry := entries[0].(map[string]any)
+	if entry["matcher"] != "startup|resume|clear|compact" {
+		t.Fatalf("matcher=%v", entry["matcher"])
+	}
+	inner := entry["hooks"].([]any)[0].(map[string]any)
+	if inner["type"] != "command" {
+		t.Fatalf("type=%v", inner["type"])
+	}
+	if inner["timeout"] != float64(10) {
+		t.Fatalf("timeout=%v", inner["timeout"])
+	}
+}
+
+func TestCodexHookMutationPreservesUnrelatedJSONAndIsIdempotent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
+	path := filepath.Join(home, "codex-home", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initial := `{
+  "experimental": true,
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "startup", "hooks": [{"type": "command", "command": "user-start", "timeout": 3}]},
+      {"matcher": "old", "hooks": [{"type": "command", "command": "flow hook session-start --harness codex", "timeout": 1}]}
+    ],
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "user-pretool"}]}
+    ]
+  }
+}`
+	if err := os.WriteFile(path, []byte(initial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New()
+	added, err := h.InstallSessionStartHook("flow hook session-start --harness codex")
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if !added {
+		t.Fatal("install added=false, want true when replacing stale hook")
+	}
+	added, err = h.InstallSessionStartHook("flow hook session-start --harness codex")
+	if err != nil {
+		t.Fatalf("second install: %v", err)
+	}
+	if added {
+		t.Fatal("second install added=true, want false for already-canonical hook")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hooks map[string]any
+	if err := json.Unmarshal(raw, &hooks); err != nil {
+		t.Fatalf("parse hooks.json: %v\n%s", err, raw)
+	}
+	if hooks["experimental"] != true {
+		t.Fatalf("top-level experimental not preserved: %#v", hooks)
+	}
+	events := hooks["hooks"].(map[string]any)
+	if !codexHookEventReferencesCommand(events, "PreToolUse", "user-pretool") {
+		t.Fatalf("PreToolUse not preserved: %#v", events["PreToolUse"])
+	}
+	sessionEntries := events["SessionStart"].([]any)
+	if !codexHookEntriesReferenceCommand(sessionEntries, "user-start") {
+		t.Fatalf("unrelated SessionStart hook not preserved: %#v", sessionEntries)
+	}
+	if got := countCodexHookCommands(sessionEntries, "flow hook session-start --harness codex"); got != 1 {
+		t.Fatalf("matching SessionStart hooks=%d, want 1; entries=%#v", got, sessionEntries)
+	}
+
+	removed, err := h.UninstallSessionStartHook("flow hook session-start --harness codex")
+	if err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	if !removed {
+		t.Fatal("UninstallSessionStartHook removed=false, want true")
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &hooks); err != nil {
+		t.Fatalf("parse hooks.json after uninstall: %v\n%s", err, raw)
+	}
+	events = hooks["hooks"].(map[string]any)
+	sessionEntries = events["SessionStart"].([]any)
+	if got := countCodexHookCommands(sessionEntries, "flow hook session-start --harness codex"); got != 0 {
+		t.Fatalf("matching hooks after uninstall=%d, want 0; entries=%#v", got, sessionEntries)
+	}
+	if !codexHookEntriesReferenceCommand(sessionEntries, "user-start") {
+		t.Fatalf("unrelated SessionStart hook not preserved after uninstall: %#v", sessionEntries)
+	}
+	if !codexHookEventReferencesCommand(events, "PreToolUse", "user-pretool") {
+		t.Fatalf("PreToolUse not preserved after uninstall: %#v", events["PreToolUse"])
+	}
+	if removed, err := h.UninstallUserPromptSubmitHook("flow hook user-prompt-submit"); err != nil || removed {
+		t.Fatalf("UninstallUserPromptSubmitHook=(%v,%v), want false,nil", removed, err)
+	}
+}
+
+func TestCodexSessionStartHookWarningDetectsDisabledConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
+	config := filepath.Join(home, "codex-home", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(config), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := New().(*codex)
+	if got := h.SessionStartHookWarning(); got != "" {
+		t.Fatalf("warning without config=%q, want empty", got)
+	}
+	if err := os.WriteFile(config, []byte("hooks = true\ncodex_hooks = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.SessionStartHookWarning(); got != "" {
+		t.Fatalf("warning with enabled config=%q, want empty", got)
+	}
+	if err := os.WriteFile(config, []byte("# hooks = false\ncodex_hooks = false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := "Codex hooks may be disabled; review ~/.codex/config.toml and Codex /hooks"
+	if got := h.SessionStartHookWarning(); got != want {
+		t.Fatalf("warning=%q, want %q", got, want)
+	}
+}
+
+func TestCodexTranscriptUnsupportedForNow(t *testing.T) {
+	h := New()
 	var out strings.Builder
 	if err := h.RenderTranscript("/tmp/work", testThreadID, false, time.Time{}, &out); err == nil || !strings.Contains(err.Error(), "not wired yet") {
 		t.Fatalf("RenderTranscript err=%v, want unsupported", err)
 	}
+}
+
+func countCodexHookCommands(entries []any, command string) int {
+	n := 0
+	for _, entry := range entries {
+		if codexHookEntryReferencesCommand(entry, command) {
+			n++
+		}
+	}
+	return n
+}
+
+func codexHookEventReferencesCommand(events map[string]any, event, command string) bool {
+	entries, _ := events[event].([]any)
+	return codexHookEntriesReferenceCommand(entries, command)
+}
+
+func codexHookEntriesReferenceCommand(entries []any, command string) bool {
+	for _, entry := range entries {
+		if codexHookEntryReferencesCommand(entry, command) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexHookEntryReferencesCommand(entry any, command string) bool {
+	m, ok := entry.(map[string]any)
+	if !ok {
+		return false
+	}
+	inner, _ := m["hooks"].([]any)
+	for _, h := range inner {
+		hm, ok := h.(map[string]any)
+		if !ok {
+			continue
+		}
+		if cmd, _ := hm["command"].(string); cmd == command {
+			return true
+		}
+	}
+	return false
 }

@@ -105,7 +105,7 @@ func cmdInit(args []string) int {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			return 1
 		}
-		if err := writeSkillVersion(Version); err != nil {
+		if err := writeSkillVersionForHarness(h, Version); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not record skill version: %v\n", err)
 		}
 		fmt.Printf("installed flow skill to %s\n", skillPath)
@@ -115,10 +115,15 @@ func cmdInit(args []string) int {
 	}
 
 	// Install the SessionStart hook idempotently.
-	if added, err := h.InstallSessionStartHook(hookCommand); err != nil {
+	if added, err := h.InstallSessionStartHook(hookCommandForHarness(h)); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not install SessionStart hook: %v\n", err)
 	} else if added {
 		fmt.Println("installed SessionStart hook")
+	}
+	if warner, ok := h.(sessionStartHookWarner); ok {
+		if msg := warner.SessionStartHookWarning(); msg != "" {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
+		}
 	}
 
 	fmt.Printf("flow initialized at %s\n", root)

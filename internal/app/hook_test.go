@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"flow/internal/flowdb"
+	"os"
 	"strings"
 	"testing"
 )
@@ -121,6 +122,107 @@ func TestHookSessionStartRequiresSkillInvocation(t *testing.T) {
 	}
 }
 
+func TestHookSessionStartCodexUsesStdinSessionID(t *testing.T) {
+	setupFlowRoot(t)
+
+	seedTask(t, "codex-stdin")
+	const sid = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, harness='codex', status='in-progress', session_started=? WHERE slug='codex-stdin'`,
+		sid, flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	withHookStdin(t, `{"session_id":"`+sid+`","thread_id":"ignored"}`)
+
+	out := captureStdout(t, func() {
+		if rc := cmdHookSessionStart([]string{"--harness", "codex"}); rc != 0 {
+			t.Fatalf("rc=%d", rc)
+		}
+	})
+	ctx := parseSessionStartContext(t, out)
+	if !strings.Contains(ctx, "codex-stdin") {
+		t.Fatalf("Codex hook did not bind from stdin session_id; ctx:\n%s", ctx)
+	}
+}
+
+func TestHookSessionStartCodexUsesStdinThreadID(t *testing.T) {
+	setupFlowRoot(t)
+
+	seedTask(t, "codex-thread-stdin")
+	const sid = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, harness='codex', status='in-progress', session_started=? WHERE slug='codex-thread-stdin'`,
+		sid, flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	withHookStdin(t, `{"thread_id":"`+sid+`"}`)
+
+	out := captureStdout(t, func() {
+		if rc := cmdHookSessionStart([]string{"--harness", "codex"}); rc != 0 {
+			t.Fatalf("rc=%d", rc)
+		}
+	})
+	ctx := parseSessionStartContext(t, out)
+	if !strings.Contains(ctx, "codex-thread-stdin") {
+		t.Fatalf("Codex hook did not bind from stdin thread_id; ctx:\n%s", ctx)
+	}
+}
+
+func TestHookSessionStartCodexFallsBackToCodeThreadID(t *testing.T) {
+	setupFlowRoot(t)
+
+	seedTask(t, "codex-thread")
+	const sid = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, harness='codex', status='in-progress', session_started=? WHERE slug='codex-thread'`,
+		sid, flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_THREAD_ID", sid)
+
+	out := captureStdout(t, func() {
+		if rc := cmdHookSessionStart([]string{"--harness", "codex"}); rc != 0 {
+			t.Fatalf("rc=%d", rc)
+		}
+	})
+	ctx := parseSessionStartContext(t, out)
+	if !strings.Contains(ctx, "codex-thread") {
+		t.Fatalf("Codex hook did not bind from CODEX_THREAD_ID; ctx:\n%s", ctx)
+	}
+}
+
+func TestHookSessionStartHarnessFlagKeepsClaudeDefaultCompatible(t *testing.T) {
+	setupFlowRoot(t)
+
+	seedTask(t, "claude-default")
+	const sid = "deadbeef-1234-4567-8abc-def012345678"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, status='in-progress', session_started=? WHERE slug='claude-default'`,
+		sid, flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
+	t.Setenv("CODEX_THREAD_ID", "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40")
+
+	out := captureStdout(t, func() {
+		if rc := cmdHookSessionStart(nil); rc != 0 {
+			t.Fatalf("rc=%d", rc)
+		}
+	})
+	ctx := parseSessionStartContext(t, out)
+	if !strings.Contains(ctx, "claude-default") {
+		t.Fatalf("default hook did not use Claude env; ctx:\n%s", ctx)
+	}
+}
+
 // TestHookUserPromptSubmitIsNoOp pins the v0.1.0-alpha.7 contract:
 // the UserPromptSubmit hook is a permanent no-op — exits 0 with no
 // stdout regardless of session state. Kept around only for forward
@@ -138,6 +240,39 @@ func TestHookUserPromptSubmitIsNoOp(t *testing.T) {
 			t.Errorf("CLAUDE_CODE_SESSION_ID=%q: expected empty stdout, got:\n%s", sid, out)
 		}
 	}
+}
+
+func withHookStdin(t *testing.T, body string) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "hook-stdin-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() {
+		os.Stdin = old
+		f.Close()
+	})
+}
+
+func parseSessionStartContext(t *testing.T, out string) string {
+	t.Helper()
+	var parsed struct {
+		HookSpecificOutput struct {
+			AdditionalContext string `json:"additionalContext"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("parse hook output: %v\nraw: %s", err, out)
+	}
+	return parsed.HookSpecificOutput.AdditionalContext
 }
 
 // TestBuildBootstrapPromptInvokesSkill pins the same invariant for the

@@ -63,13 +63,20 @@ func withTempHome(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	oldHome := os.Getenv("HOME")
+	oldCodexHome := os.Getenv("CODEX_HOME")
 	oldClaudeSID := os.Getenv("CLAUDE_CODE_SESSION_ID")
 	oldCodexSID := os.Getenv("CODEX_THREAD_ID")
 	os.Setenv("HOME", dir)
+	os.Unsetenv("CODEX_HOME")
 	os.Unsetenv("CLAUDE_CODE_SESSION_ID")
 	os.Unsetenv("CODEX_THREAD_ID")
 	t.Cleanup(func() {
 		os.Setenv("HOME", oldHome)
+		if oldCodexHome == "" {
+			os.Unsetenv("CODEX_HOME")
+		} else {
+			os.Setenv("CODEX_HOME", oldCodexHome)
+		}
 		os.Setenv("CLAUDE_CODE_SESSION_ID", oldClaudeSID)
 		os.Setenv("CODEX_THREAD_ID", oldCodexSID)
 	})
@@ -323,6 +330,74 @@ func TestSkillInstallSkipHook(t *testing.T) {
 	}
 }
 
+func TestSkillInstallHarnessCodexWritesAgentSkill(t *testing.T) {
+	home := withTempHome(t)
+
+	if rc := cmdSkill([]string{"install", "--harness", "codex"}); rc != 0 {
+		t.Fatalf("install --harness codex rc=%d", rc)
+	}
+	codexPath := filepath.Join(home, ".agents", "skills", "flow", "SKILL.md")
+	data, err := os.ReadFile(codexPath)
+	if err != nil {
+		t.Fatalf("read codex skill: %v", err)
+	}
+	if !strings.Contains(string(data), "name: flow") {
+		t.Fatalf("codex skill missing frontmatter")
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude", "skills", "flow", "SKILL.md")); !os.IsNotExist(err) {
+		t.Fatalf("claude skill should not be installed by --harness codex; err=%v", err)
+	}
+}
+
+func TestSkillInstallHarnessAllWritesClaudeAndCodex(t *testing.T) {
+	home := withTempHome(t)
+
+	if rc := cmdSkill([]string{"install", "--harness", "all"}); rc != 0 {
+		t.Fatalf("install --harness all rc=%d", rc)
+	}
+	for _, path := range []string{
+		filepath.Join(home, ".claude", "skills", "flow", "SKILL.md"),
+		filepath.Join(home, ".agents", "skills", "flow", "SKILL.md"),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("skill missing at %s: %v", path, err)
+		}
+	}
+}
+
+func TestSkillInstallCodexWritesDistinctHookCommand(t *testing.T) {
+	home := withTempHome(t)
+
+	if rc := cmdSkill([]string{"install", "--harness", "codex"}); rc != 0 {
+		t.Fatalf("install --harness codex rc=%d", rc)
+	}
+	hooks := readSettings(t, filepath.Join(home, ".codex", "hooks.json"))
+	events, _ := hooks["hooks"].(map[string]any)
+	if !hookEventReferencesCommand(events, "SessionStart", "flow hook session-start --harness codex") {
+		t.Fatalf("codex SessionStart hook missing: %#v", events["SessionStart"])
+	}
+	if hookEventReferencesCommand(events, "SessionStart", "flow hook session-start") {
+		t.Fatalf("codex hook should not use claude command: %#v", events["SessionStart"])
+	}
+}
+
+func TestSkillUninstallHarnessCodexRemovesOnlyCodexSkill(t *testing.T) {
+	home := withTempHome(t)
+	if rc := cmdSkill([]string{"install", "--harness", "all"}); rc != 0 {
+		t.Fatalf("install --harness all rc=%d", rc)
+	}
+
+	if rc := cmdSkill([]string{"uninstall", "--harness", "codex"}); rc != 0 {
+		t.Fatalf("uninstall --harness codex rc=%d", rc)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".agents", "skills", "flow")); !os.IsNotExist(err) {
+		t.Fatalf("codex skill dir still present or unexpected err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude", "skills", "flow", "SKILL.md")); err != nil {
+		t.Fatalf("claude skill should remain: %v", err)
+	}
+}
+
 func TestSkillUnknownSubcommand(t *testing.T) {
 	if rc := cmdSkill([]string{"wat"}); rc != 2 {
 		t.Errorf("unknown subcommand rc=%d, want 2", rc)
@@ -356,6 +431,23 @@ func TestSkillMentionsPlaybooks(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("skill missing %q", want)
+		}
+	}
+}
+
+func TestSkillHasCodexHarnessSection(t *testing.T) {
+	got := string(embeddedSkill)
+	for _, want := range []string{
+		"### Codex harness",
+		"flow do --harness codex <task>",
+		"flow do --here --harness codex <task>",
+		"$CODEX_THREAD_ID",
+		"$CLAUDE_CODE_SESSION_ID",
+		"~/.agents/skills/flow/SKILL.md",
+		"review Codex `/hooks`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("skill missing Codex harness content %q", want)
 		}
 	}
 }

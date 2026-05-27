@@ -2,14 +2,18 @@ package app
 
 import (
 	"encoding/json"
-	"flow/internal/flowdb"
 	"fmt"
+	"io"
 	"os"
+	"strings"
+
+	"flow/internal/flowdb"
+	"flow/internal/harness"
 )
 
 // cmdHook dispatches `flow hook <subcommand>`. Two subcommands:
 //
-//   - session-start: wired as a Claude Code SessionStart hook so that
+//   - session-start: wired as a harness SessionStart hook so that
 //     every session start (fresh spawn AND resume) re-injects the
 //     "load your task context" instruction. Without it, resumed
 //     sessions never re-read briefs and updates that may have been
@@ -34,28 +38,44 @@ func cmdHook(args []string) int {
 	}
 }
 
-// cmdHookSessionStart emits a Claude Code SessionStart hook response.
-// Wired via ~/.claude/settings.json with a matcher of "startup|resume"
-// so it fires for both fresh spawns and `claude --resume`.
+// cmdHookSessionStart emits a SessionStart hook response. The selected
+// harness determines which session-id env/input shape is used.
 //
 // Two modes, branching on whether this session is bound to a flow
 // task. The binding is discovered via reverse-lookup on the
-// $CLAUDE_CODE_SESSION_ID env var (Claude Code injects this into
-// every session) against tasks.session_id:
+// selected harness's session id against tasks.session_id:
 //   - Bound (a task carries this session_id): emit the full
 //     task-context reload instructions. On a fresh spawn this is
 //     redundant with the bootstrap prompt but harmless; on a resume
 //     it's the only way to force the agent to re-read potentially-
 //     updated briefs and updates.
-//   - Unbound (no task carries it, or env var missing): emit the
-//     ambient skill hint so Claude knows the flow skill is available.
+//   - Unbound (no task carries it, or env/input is missing): emit the
+//     ambient skill hint so the agent knows the flow skill is available.
 func cmdHookSessionStart(args []string) int {
 	fs := flagSet("hook session-start")
+	harnessFlag := fs.String("harness", "claude", "hook harness: auto, claude, or codex")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	name, err := parseHarnessName(*harnessFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
+	var h harness.Harness
+	if name == "" {
+		h = defaultHarness()
+	} else {
+		h, err = harnessByName(string(name))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 2
+		}
+	}
+	input := readHookStdin()
+	sid := sessionIDFromHookInput(h, input)
 
-	slug := lookupBoundTaskSlug()
+	slug := lookupBoundTaskSlug(h, sid)
 	if slug == "" {
 		return emitAmbientSkillHint()
 	}
@@ -92,6 +112,43 @@ func cmdHookSessionStart(args []string) int {
 	return emitSessionStartContext(instructions + appendStaleVersionHint())
 }
 
+type hookInput struct {
+	SessionID string `json:"session_id"`
+	ThreadID  string `json:"thread_id"`
+}
+
+func readHookStdin() []byte {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return nil
+	}
+	if info.Mode()&os.ModeCharDevice != 0 {
+		return nil
+	}
+	b, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+func sessionIDFromHookInput(h harness.Harness, b []byte) string {
+	if len(strings.TrimSpace(string(b))) == 0 {
+		return ""
+	}
+	var in hookInput
+	if err := json.Unmarshal(b, &in); err != nil {
+		return ""
+	}
+	if in.SessionID != "" {
+		return in.SessionID
+	}
+	if h.Name() == harness.NameCodex && in.ThreadID != "" {
+		return in.ThreadID
+	}
+	return ""
+}
+
 // appendStaleVersionHint returns a short suffix to add to SessionStart
 // hint payloads when the local flow binary is older than the latest
 // GitHub release. Returns "" when the check fails, the cache is fresh
@@ -119,8 +176,10 @@ func appendStaleVersionHint() string {
 // env var is unset, or the DB lookup fails. Hook code must never
 // fail loud — a hook error blocks the user's session — so all errors
 // are swallowed and treated as "unbound".
-func lookupBoundTaskSlug() string {
-	sid := os.Getenv("CLAUDE_CODE_SESSION_ID")
+func lookupBoundTaskSlug(h harness.Harness, sid string) string {
+	if sid == "" {
+		sid = os.Getenv(h.SessionIDEnvVar())
+	}
 	if sid == "" {
 		return ""
 	}
@@ -137,14 +196,20 @@ func lookupBoundTaskSlug() string {
 	if err != nil {
 		return ""
 	}
+	if t.Harness.Valid && t.Harness.String != "" && t.Harness.String != string(h.Name()) {
+		return ""
+	}
+	if h.Name() == harness.NameCodex && (!t.Harness.Valid || t.Harness.String == "") {
+		return ""
+	}
 	return t.Slug
 }
 
 // emitAmbientSkillHint is the unbound-session branch of the
 // SessionStart hook. The user has installed flow — a personal task/
 // session manager and knowledge base — and benefits from having work
-// flow through it. The hint frames that value prop and tells Claude
-// to load the skill; it deliberately does NOT ask Claude to pre-judge
+// flow through it. The hint frames that value prop and tells the agent
+// to load the skill; it deliberately does NOT ask the agent to pre-judge
 // whether the user's request is "substantive enough". That gate is
 // the skill's job, not the hook's.
 func emitAmbientSkillHint() int {
@@ -155,12 +220,12 @@ func emitAmbientSkillHint() int {
 	if r, err := flowRoot(); err == nil {
 		root = r
 	}
-	hint := "This Claude session is not bound to a flow task — this hint IS the " +
+	hint := "This agent session is not bound to a flow task — this hint IS the " +
 		"binding answer. Do NOT re-probe binding with `flow show task` (no arg) " +
 		"until you've actually bound this session via `flow do --here <slug>`; " +
 		"until then it will error and waste a tool call. The user already tracks " +
 		"their work and knowledge in flow — a personal task and session manager that " +
-		"captures work as briefs, logs progress notes, resumes Claude sessions across " +
+		"captures work as briefs, logs progress notes, resumes agent sessions across " +
 		"days, and maintains a central knowledge base of durable facts about them, " +
 		"their org, and their work. Their tasks, projects, and KB already exist. " +
 		"Invoke the `flow` skill via the Skill tool now and let it run alongside the " +
@@ -190,7 +255,7 @@ func emitSessionStartContext(ctx string) int {
 }
 
 // emitHookContext marshals a hookSpecificOutput payload for the given
-// Claude Code hook event name. Used by both SessionStart and
+// hook event name. Used by both SessionStart and
 // UserPromptSubmit hook handlers.
 func emitHookContext(event, ctx string) int {
 	out := map[string]any{

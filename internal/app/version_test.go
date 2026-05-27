@@ -124,3 +124,68 @@ func TestMaybeAutoUpgradeSkipsWhenSkillMissing(t *testing.T) {
 		t.Errorf("auto-upgrade created a skill file when none existed; err=%v", err)
 	}
 }
+
+func TestMaybeAutoUpgradeUpdatesInstalledCodexSkill(t *testing.T) {
+	home := withTempHome(t)
+	withVersion(t, "v1.0.0")
+	if rc := cmdSkill([]string{"install", "--harness", "codex"}); rc != 0 {
+		t.Fatalf("install codex rc=%d", rc)
+	}
+	skillPath := filepath.Join(home, ".agents", "skills", "flow", "SKILL.md")
+	if err := os.WriteFile(skillPath, []byte("stale codex"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	Version = "v2.0.0"
+	maybeAutoUpgradeSkill()
+
+	got, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) == "stale codex" {
+		t.Error("auto-upgrade did not refresh Codex SKILL.md")
+	}
+	versionPath := filepath.Join(home, ".agents", "skills", "flow", "VERSION")
+	if got, err := os.ReadFile(versionPath); err != nil || string(got) != "v2.0.0\n" {
+		t.Fatalf("Codex VERSION=(%q,%v), want v2.0.0", got, err)
+	}
+}
+
+func TestMaybeAutoUpgradeDoesNotInstallMissingCodexSkill(t *testing.T) {
+	home := withTempHome(t)
+	withVersion(t, "v2.0.0")
+	if rc := cmdSkill([]string{"install", "--harness", "claude"}); rc != 0 {
+		t.Fatalf("install claude rc=%d", rc)
+	}
+
+	maybeAutoUpgradeSkill()
+
+	if _, err := os.Stat(filepath.Join(home, ".agents", "skills", "flow", "SKILL.md")); !os.IsNotExist(err) {
+		t.Fatalf("auto-upgrade created missing Codex skill; err=%v", err)
+	}
+}
+
+func TestMaybeAutoUpgradeUpdatesEachInstalledHarnessSidecar(t *testing.T) {
+	home := withTempHome(t)
+	withVersion(t, "v1.0.0")
+	if rc := cmdSkill([]string{"install", "--harness", "all"}); rc != 0 {
+		t.Fatalf("install all rc=%d", rc)
+	}
+
+	Version = "v2.0.0"
+	maybeAutoUpgradeSkill()
+
+	for _, path := range []string{
+		filepath.Join(home, ".claude", "skills", "flow", "VERSION"),
+		filepath.Join(home, ".agents", "skills", "flow", "VERSION"),
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if string(got) != "v2.0.0\n" {
+			t.Fatalf("%s=%q, want v2.0.0", path, got)
+		}
+	}
+}
