@@ -505,6 +505,94 @@ func TestCmdDoFreshDetectsWorkDirChangedWithSameUpdatedAtDuringPrepare(t *testin
 	}
 }
 
+func TestCmdDoFreshDetectsKindChangedWithSameUpdatedAtDuringPrepare(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "same-updated-at-kind")
+	spawns, _ := stubITerm(t)
+
+	db := openFlowDB(t)
+	original, err := flowdb.GetTask(db, "same-updated-at-kind")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) {
+		_, err := db.Exec(
+			`UPDATE tasks SET kind=?, updated_at=? WHERE slug='same-updated-at-kind'`,
+			"playbook_run", original.UpdatedAt,
+		)
+		return "22222222-3333-4444-8555-777777777778", err
+	}
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	if rc := cmdDo([]string{"same-updated-at-kind"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+
+	task, err := flowdb.GetTask(db, "same-updated-at-kind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.SessionID.Valid {
+		t.Fatalf("session_id=%q, want NULL", task.SessionID.String)
+	}
+	if task.Kind != "playbook_run" {
+		t.Fatalf("kind=%q, want concurrent update playbook_run preserved", task.Kind)
+	}
+}
+
+func TestCmdDoFreshDetectsPlaybookSlugChangedWithSameUpdatedAtDuringPrepare(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "same-updated-at-playbook-slug")
+	spawns, _ := stubITerm(t)
+
+	db := openFlowDB(t)
+	original, err := flowdb.GetTask(db, "same-updated-at-playbook-slug")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := flowdb.NowISO()
+	if _, err := db.Exec(
+		`INSERT INTO playbooks (slug, name, work_dir, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		"pb-race", "PB Race", original.WorkDir, now, now,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) {
+		_, err := db.Exec(
+			`UPDATE tasks SET playbook_slug=?, updated_at=? WHERE slug='same-updated-at-playbook-slug'`,
+			"pb-race", original.UpdatedAt,
+		)
+		return "22222222-3333-4444-8555-777777777779", err
+	}
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	if rc := cmdDo([]string{"same-updated-at-playbook-slug"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+
+	task, err := flowdb.GetTask(db, "same-updated-at-playbook-slug")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.SessionID.Valid {
+		t.Fatalf("session_id=%q, want NULL", task.SessionID.String)
+	}
+	if !task.PlaybookSlug.Valid || task.PlaybookSlug.String != "pb-race" {
+		t.Fatalf("playbook_slug=%+v, want concurrent update pb-race preserved", task.PlaybookSlug)
+	}
+}
+
 func TestCmdDoFreshConcurrentBindDuringPrepareRefuses(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "concurrent-bind")
