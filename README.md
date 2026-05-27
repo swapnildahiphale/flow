@@ -244,42 +244,45 @@ and trust the flow hook before expecting automatic session binding.
 
 ### Manual Codex QA
 
-Use an isolated worktree, temp binary, temp home, and temp flow root so
-the smoke run never touches your normal `~/.flow`, Claude, or Codex
-integration files:
+Use an isolated worktree, temp binary, and temp flow root so the smoke
+run never touches your normal `~/.flow` data. Run `flow init` with a
+temp `HOME` so it does not modify your real Claude skill or hook:
 
 ```bash
 cd /private/tmp/flow-codex-support
 mkdir -p /private/tmp/flow-codex-support/bin /private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-dev/home
 GOCACHE=/private/tmp/flow-codex-dev/go-cache go build -o /private/tmp/flow-codex-support/bin/flow .
 export FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root
-export HOME=/private/tmp/flow-codex-dev/home
 export PATH=/private/tmp/flow-codex-support/bin:$PATH
-flow init
+HOME=/private/tmp/flow-codex-dev/home flow init
 ```
 
-`flow init` installs the default Claude skill and hook under the temp
-`HOME` above. Before intentionally installing the Codex skill or hook
-against your real home, back up the real Codex integration files:
+For a real Codex smoke, use your normal `HOME` so Codex can use its
+existing auth/config. That intentionally writes the Codex skill and
+hook, so back up those real Codex integration files first:
 
 ```bash
 ts=$(date +%Y%m%d%H%M%S)
 [ ! -e ~/.agents/skills/flow ] || cp -a ~/.agents/skills/flow ~/.agents/skills/flow.backup.$ts
 [ ! -e ~/.codex/hooks.json ] || cp -a ~/.codex/hooks.json ~/.codex/hooks.json.backup.$ts
-flow skill install --harness codex --force
 ```
 
-After install, review Codex `/hooks` and trust the flow hook if Codex
-asks. Then smoke the Codex path under the temp `HOME` and `FLOW_ROOT`:
+Then smoke the Codex path under the temp `FLOW_ROOT`. After the
+`flow skill install --harness codex --force` command, review Codex
+`/hooks` and trust the flow hook if Codex asks:
 
 ```bash
-HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow init
-HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow add task "Codex Smoke" --slug codex-smoke --work-dir /private/tmp/flow-codex-support
-HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow skill install --harness codex --force
-HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow do --harness codex codex-smoke
-HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow transcript codex-smoke --compact
-HOME=/private/tmp/flow-codex-dev/home FLOW_ROOT=/private/tmp/flow-codex-dev/flow-root /private/tmp/flow-codex-support/bin/flow done codex-smoke
+/private/tmp/flow-codex-support/bin/flow add task "Codex Smoke" --slug codex-smoke --work-dir /private/tmp/flow-codex-support
+/private/tmp/flow-codex-support/bin/flow skill install --harness codex --force
+/private/tmp/flow-codex-support/bin/flow do --harness codex codex-smoke
+/private/tmp/flow-codex-support/bin/flow transcript codex-smoke --compact
+/private/tmp/flow-codex-support/bin/flow done codex-smoke
 ```
+
+If you set `HOME` or `CODEX_HOME` explicitly before `flow do --harness
+codex`, flow propagates those values into the spawned Codex tab so the
+interactive `codex resume` uses the same Codex state as the allocation
+step.
 
 ## What you get
 

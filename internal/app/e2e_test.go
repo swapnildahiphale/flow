@@ -307,6 +307,12 @@ func TestE2ECodexHarnessRoundtrip(t *testing.T) {
 	}
 	if script := getScript(); !strings.Contains(script, "codex resume "+sid) {
 		t.Fatalf("spawn script missing codex resume: %s", script)
+	} else {
+		for key, value := range map[string]string{"FLOW_ROOT": flowRoot, "HOME": tmp, "CODEX_HOME": codexHome} {
+			if !strings.Contains(script, key+"=") || !strings.Contains(script, value) {
+				t.Fatalf("spawn script missing %s=%s propagation: %s", key, value, script)
+			}
+		}
 	}
 
 	writeAppCodexRollout(t, codexHome, sid, `{"type":"session_meta","payload":{"id":"`+sid+`"},"timestamp":"2026-05-28T10:00:00Z"}

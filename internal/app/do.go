@@ -435,14 +435,23 @@ func cmdDo(args []string) int {
 		// harness used when it first wrote its transcript.
 		command = h.ResumeCmd(sessionID, launchOpts)
 	}
-	// Env propagation. Flow never injects harness-specific env vars
-	// (the harness exports its own session id env; flow only reads
-	// it). The one exception is $FLOW_ROOT — flow's own data root —
-	// which the spawned session needs to read the same flow.db / kb
-	// / briefs as the parent process.
+	// Env propagation. Flow never injects harness session-id vars
+	// (the harness exports those; flow only reads them). It does
+	// propagate explicit parent context needed for the child to see
+	// the same data/config roots as the allocating process.
 	var spawnEnv map[string]string
-	if root := os.Getenv("FLOW_ROOT"); root != "" {
-		spawnEnv = map[string]string{"FLOW_ROOT": root}
+	addSpawnEnv := func(key string) {
+		if value := os.Getenv(key); value != "" {
+			if spawnEnv == nil {
+				spawnEnv = map[string]string{}
+			}
+			spawnEnv[key] = value
+		}
+	}
+	addSpawnEnv("FLOW_ROOT")
+	addSpawnEnv("HOME")
+	if h.Name() == harness.NameCodex {
+		addSpawnEnv("CODEX_HOME")
 	}
 	if err := spawner.SpawnTab(buildTabTitle(project, task), task.WorkDir, command, spawnEnv); err != nil {
 		if needsBootstrap {
