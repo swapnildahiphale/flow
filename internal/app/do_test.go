@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"errors"
 	"flow/internal/flowdb"
+	"flow/internal/harness"
 	"flow/internal/harness/claude"
+	"flow/internal/harness/codex"
 	"flow/internal/iterm"
 	"flow/internal/spawner"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +39,40 @@ func stubNewUUID(t *testing.T, sid string) {
 	old := claude.NewUUID
 	claude.NewUUID = func() (string, error) { return sid, nil }
 	t.Cleanup(func() { claude.NewUUID = old })
+}
+
+type capturedCodexCommand struct {
+	ctx  harness.SessionContext
+	args []string
+}
+
+func stubCodexCommandRunner(t *testing.T, fn func(call int, ctx harness.SessionContext, args []string) ([]byte, error)) *[]capturedCodexCommand {
+	t.Helper()
+	oldRunner := codex.CommandRunner
+	oldPS := codex.PSRunner
+	calls := &[]capturedCodexCommand{}
+	codex.CommandRunner = func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		cp := append([]string(nil), args...)
+		*calls = append(*calls, capturedCodexCommand{ctx: ctx, args: cp})
+		return fn(len(*calls), ctx, cp)
+	}
+	codex.PSRunner = func() ([]byte, error) {
+		return []byte("  PID COMMAND\n"), nil
+	}
+	t.Cleanup(func() {
+		codex.CommandRunner = oldRunner
+		codex.PSRunner = oldPS
+	})
+	return calls
+}
+
+func hasEnvValue(env []string, want string) bool {
+	for _, got := range env {
+		if got == want {
+			return true
+		}
+	}
+	return false
 }
 
 // stubITerm replaces iterm.Runner with a counter + captured-script
@@ -334,6 +371,145 @@ func TestCmdDoFreshAllocatesSessionID(t *testing.T) {
 	}
 	if !strings.Contains(script, "fresh-task") {
 		t.Errorf("spawn script missing task slug: %s", script)
+	}
+}
+
+func TestCmdDoHarnessCodexFreshAllocatesBootstrapsAndSpawns(t *testing.T) {
+	root := setupFlowRoot(t)
+	seedTask(t, "codex-fresh")
+	_, getScript := stubITerm(t)
+
+	calls := stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+		switch call {
+		case 1:
+			return []byte(`{"type":"thread.started","thread":{"thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}}` + "\n"), nil
+		case 2:
+			return nil, nil
+		default:
+			t.Fatalf("unexpected codex call %d: %q", call, args)
+			return nil, nil
+		}
+	})
+
+	if rc := cmdDo([]string{"codex-fresh", "--harness", "codex"}); rc != 0 {
+		t.Fatalf("cmdDo rc=%d", rc)
+	}
+
+	if len(*calls) != 2 {
+		t.Fatalf("codex calls=%d, want 2 (%#v)", len(*calls), *calls)
+	}
+	if !slices.Equal((*calls)[0].args[:3], []string{"exec", "--json", "--skip-git-repo-check"}) {
+		t.Fatalf("allocation args=%q", (*calls)[0].args)
+	}
+	if !strings.Contains((*calls)[0].args[3], "Initialize a new flow-managed Codex thread") {
+		t.Fatalf("allocation prompt=%q", (*calls)[0].args[3])
+	}
+	wantBootstrapPrefix := []string{"exec", "resume", "--skip-git-repo-check", "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}
+	if !slices.Equal((*calls)[1].args[:4], wantBootstrapPrefix) {
+		t.Fatalf("bootstrap args=%q, want prefix %q", (*calls)[1].args, wantBootstrapPrefix)
+	}
+	if !strings.Contains((*calls)[1].args[4], "execution session for flow task codex-fresh") {
+		t.Fatalf("bootstrap prompt missing task slug: %q", (*calls)[1].args[4])
+	}
+	if !hasEnvValue((*calls)[0].ctx.Env, "FLOW_ROOT="+root) || !hasEnvValue((*calls)[1].ctx.Env, "FLOW_ROOT="+root) {
+		t.Fatalf("FLOW_ROOT was not propagated into codex ctx: %#v", *calls)
+	}
+
+	db := openFlowDB(t)
+	task, err := flowdb.GetTask(db, "codex-fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.Harness.Valid || task.Harness.String != "codex" {
+		t.Fatalf("harness=%+v, want codex", task.Harness)
+	}
+	if !task.SessionID.Valid || task.SessionID.String != "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40" {
+		t.Fatalf("session_id=%+v", task.SessionID)
+	}
+	script := getScript()
+	if !strings.Contains(script, "codex resume 018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40") {
+		t.Fatalf("spawn script missing codex resume: %s", script)
+	}
+}
+
+func TestCmdDoHarnessCodexBootstrapFailureRollsBackFreshBind(t *testing.T) {
+	cases := []struct {
+		name        string
+		prePin      string
+		preSession  string
+		args        []string
+		wantHarness string
+	}{
+		{
+			name:        "clears unpinned fresh bind",
+			args:        []string{"codex-rollback-clear", "--harness", "codex"},
+			wantHarness: "",
+		},
+		{
+			name:        "restores prior harness pin",
+			prePin:      "claude",
+			preSession:  "11111111-2222-4333-8444-555555555555",
+			args:        []string{"codex-rollback-restore", "--harness", "codex", "--fresh"},
+			wantHarness: "claude",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupFlowRoot(t)
+			slug := tc.args[0]
+			seedTask(t, slug)
+			spawns, _ := stubITerm(t)
+			db := openFlowDB(t)
+			if tc.prePin != "" {
+				if _, err := db.Exec(
+					`UPDATE tasks SET harness=?, session_id=?, session_started=? WHERE slug=?`,
+					tc.prePin, tc.preSession, flowdb.NowISO(), slug,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+				switch call {
+				case 1:
+					return []byte(`{"type":"thread.started","thread":{"thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}}` + "\n"), nil
+				case 2:
+					return nil, errors.New("bootstrap blew up")
+				default:
+					t.Fatalf("unexpected codex call %d", call)
+					return nil, nil
+				}
+			})
+
+			stderr := captureStderr(t)
+			if rc := cmdDo(tc.args); rc != 1 {
+				t.Fatalf("cmdDo rc=%d, want 1", rc)
+			}
+			if !strings.Contains(stderr(), "bootstrap session") {
+				t.Fatalf("stderr missing bootstrap failure")
+			}
+			if got := atomic.LoadInt64(spawns); got != 0 {
+				t.Fatalf("spawn count=%d, want 0", got)
+			}
+
+			task, err := flowdb.GetTask(db, slug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if task.Status != "backlog" {
+				t.Fatalf("status=%q, want backlog", task.Status)
+			}
+			if task.SessionID.Valid {
+				t.Fatalf("session_id=%+v, want NULL", task.SessionID)
+			}
+			gotHarness := ""
+			if task.Harness.Valid {
+				gotHarness = task.Harness.String
+			}
+			if gotHarness != tc.wantHarness {
+				t.Fatalf("harness=%q, want %q", gotHarness, tc.wantHarness)
+			}
+		})
 	}
 }
 

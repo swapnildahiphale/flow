@@ -63,8 +63,16 @@ func withTempHome(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	oldHome := os.Getenv("HOME")
+	oldClaudeSID := os.Getenv("CLAUDE_CODE_SESSION_ID")
+	oldCodexSID := os.Getenv("CODEX_THREAD_ID")
 	os.Setenv("HOME", dir)
-	t.Cleanup(func() { os.Setenv("HOME", oldHome) })
+	os.Unsetenv("CLAUDE_CODE_SESSION_ID")
+	os.Unsetenv("CODEX_THREAD_ID")
+	t.Cleanup(func() {
+		os.Setenv("HOME", oldHome)
+		os.Setenv("CLAUDE_CODE_SESSION_ID", oldClaudeSID)
+		os.Setenv("CODEX_THREAD_ID", oldCodexSID)
+	})
 	return dir
 }
 

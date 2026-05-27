@@ -5,6 +5,7 @@ import (
 	"flow/internal/flowdb"
 	"flow/internal/harness"
 	"flow/internal/harness/claude"
+	"flow/internal/harness/codex"
 	"testing"
 )
 
@@ -27,6 +28,19 @@ func stubClaudeRunner(t *testing.T, retErr error) *[]capturedClaudeCall {
 		return retErr
 	}
 	t.Cleanup(func() { claude.SkipPermissionsRunner = old })
+	return calls
+}
+
+func stubCodexDoneRunner(t *testing.T, retErr error) *[]capturedCodexCommand {
+	t.Helper()
+	old := codex.CommandRunner
+	calls := &[]capturedCodexCommand{}
+	codex.CommandRunner = func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		cp := append([]string(nil), args...)
+		*calls = append(*calls, capturedCodexCommand{ctx: ctx, args: cp})
+		return nil, retErr
+	}
+	t.Cleanup(func() { codex.CommandRunner = old })
 	return calls
 }
 
@@ -162,6 +176,39 @@ func TestCmdDoneRunsSweepWhenSessionExists(t *testing.T) {
 		if !contains(got.prompt, want) {
 			t.Errorf("prompt missing %q", want)
 		}
+	}
+}
+
+func TestCmdDoneUsesCodexHarnessForCloseoutSweep(t *testing.T) {
+	setupFlowRoot(t)
+	calls := stubCodexDoneRunner(t, nil)
+	if rc := cmdAdd([]string{"task", "Codex Done"}); rc != 0 {
+		t.Fatalf("add rc=%d", rc)
+	}
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, session_started=?, harness=? WHERE slug=?`,
+		"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40", flowdb.NowISO(), "codex", "codex-done",
+	); err != nil {
+		t.Fatalf("seed codex session: %v", err)
+	}
+	db.Close()
+
+	if rc := cmdDone([]string{"codex-done"}); rc != 0 {
+		t.Fatalf("done rc=%d, want 0", rc)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("codex calls=%d, want 1", len(*calls))
+	}
+	got := (*calls)[0]
+	wantPrefix := []string{"exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"}
+	for i, want := range wantPrefix {
+		if got.args[i] != want {
+			t.Fatalf("codex args=%q, want prefix %q", got.args, wantPrefix)
+		}
+	}
+	if !contains(got.args[3], "flow transcript codex-done") {
+		t.Fatalf("closeout prompt missing codex task slug: %q", got.args[3])
 	}
 }
 

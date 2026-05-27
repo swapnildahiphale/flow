@@ -230,44 +230,6 @@ func TestCmdDoRejectsExtraTrailingArgument(t *testing.T) {
 	}
 }
 
-func TestCmdDoExplicitCodexFailsBeforeSessionAllocation(t *testing.T) {
-	setupFlowRoot(t)
-	seedTask(t, "harness-codex")
-	count, _ := stubITerm(t)
-
-	oldNewUUID := claude.NewUUID
-	claude.NewUUID = func() (string, error) {
-		t.Fatal("claude.NewUUID should not be called for unsupported explicit codex")
-		return "", nil
-	}
-	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
-
-	stderr := captureStderr(t)
-	rc := cmdDo([]string{"harness-codex", "--harness", "codex"})
-	if rc == 0 {
-		t.Fatalf("cmdDo rc=%d, want non-zero", rc)
-	}
-	got := stderr()
-	if !strings.Contains(got, "codex") || !strings.Contains(got, "isn't supported") {
-		t.Fatalf("stderr=%q", got)
-	}
-	if *count != 0 {
-		t.Fatalf("spawn count=%d, want 0", *count)
-	}
-
-	db := openFlowDB(t)
-	task, err := flowdb.GetTask(db, "harness-codex")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if task.SessionID.Valid {
-		t.Fatalf("session_id=%+v, want NULL", task.SessionID)
-	}
-	if task.Harness.Valid && task.Harness.String != "" {
-		t.Fatalf("harness=%+v, want NULL/empty", task.Harness)
-	}
-}
-
 // TestCmdDoRefusesUnsupportedHarnessPin pins the two
 // related contracts:
 //
@@ -288,6 +250,7 @@ func TestCmdDoRefusesUnsupportedHarnessPin(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "future-pin")
 	_, _ = stubITerm(t)
+	withHarnessRegistry(t, claude.New())
 
 	for _, h := range allHarnesses() {
 		t.Setenv(h.SessionIDEnvVar(), "")
@@ -508,6 +471,17 @@ func TestHarnessForSpawnExplicitClaudeOnUnpinnedTask(t *testing.T) {
 	}
 }
 
+func TestHarnessForSpawnExplicitCodexOnUnpinnedTask(t *testing.T) {
+	task := &flowdb.Task{Slug: "t"}
+	h, err := harnessForSpawn(task, harness.NameCodex, false)
+	if err != nil {
+		t.Fatalf("harnessForSpawn: %v", err)
+	}
+	if h.Name() != harness.NameCodex {
+		t.Fatalf("got %s, want codex", h.Name())
+	}
+}
+
 func TestHarnessForSpawnPinnedClaudeExplicitCodexWithoutFreshErrors(t *testing.T) {
 	task := &flowdb.Task{
 		Slug:    "t",
@@ -520,8 +494,6 @@ func TestHarnessForSpawnPinnedClaudeExplicitCodexWithoutFreshErrors(t *testing.T
 }
 
 func TestHarnessForSpawnPinnedClaudeExplicitCodexWithFreshResolvesExplicit(t *testing.T) {
-	fakeCodex := fakeHarness{name: harness.NameCodex, envVar: "CODEX_THREAD_ID"}
-	withHarnessRegistry(t, claude.New(), fakeCodex)
 	task := &flowdb.Task{
 		Slug:    "t",
 		Harness: sql.NullString{Valid: true, String: string(harness.NameClaude)},
@@ -536,6 +508,7 @@ func TestHarnessForSpawnPinnedClaudeExplicitCodexWithFreshResolvesExplicit(t *te
 }
 
 func TestHarnessForSpawnExplicitCodexUnregisteredErrors(t *testing.T) {
+	withHarnessRegistry(t, claude.New())
 	_, err := harnessForSpawn(&flowdb.Task{Slug: "t"}, harness.NameCodex, false)
 	if err == nil || !strings.Contains(err.Error(), "codex") || !strings.Contains(err.Error(), "isn't supported") {
 		t.Fatalf("err=%v, want unsupported codex", err)

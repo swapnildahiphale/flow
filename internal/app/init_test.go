@@ -19,11 +19,17 @@ func initTempFlowRoot(t *testing.T) string {
 
 	oldRoot := os.Getenv("FLOW_ROOT")
 	oldHome := os.Getenv("HOME")
+	oldClaudeSID := os.Getenv("CLAUDE_CODE_SESSION_ID")
+	oldCodexSID := os.Getenv("CODEX_THREAD_ID")
 	os.Setenv("FLOW_ROOT", root)
 	os.Setenv("HOME", home)
+	os.Unsetenv("CLAUDE_CODE_SESSION_ID")
+	os.Unsetenv("CODEX_THREAD_ID")
 	t.Cleanup(func() {
 		os.Setenv("FLOW_ROOT", oldRoot)
 		os.Setenv("HOME", oldHome)
+		os.Setenv("CLAUDE_CODE_SESSION_ID", oldClaudeSID)
+		os.Setenv("CODEX_THREAD_ID", oldCodexSID)
 	})
 	return root
 }
