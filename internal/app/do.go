@@ -174,16 +174,19 @@ func cmdDo(args []string) int {
 		return 1
 	}
 
-	cwd := task.WorkDir
-	if cwd == "" {
-		fmt.Fprintf(os.Stderr, "error: task %q has no work_dir\n", task.Slug)
-		return 1
-	}
 	launchOpts := harness.LaunchOpts{
 		SkipPermissions: *dangerSkip,
 		Inject:          injectionText,
 	}
 	sessionCtx := harness.SessionContext{WorkDir: task.WorkDir, Env: os.Environ()}
+	expectedSessionID := ""
+	if task.SessionID.Valid {
+		expectedSessionID = task.SessionID.String
+	}
+	expectedHarness := ""
+	if task.Harness.Valid {
+		expectedHarness = task.Harness.String
+	}
 
 	if task.Status == "done" && injectionText == "" {
 		fmt.Fprintf(os.Stderr,
@@ -220,6 +223,10 @@ func cmdDo(args []string) int {
 	var prepared harness.PreparedSession
 	snapshotNeedsBootstrap := !task.SessionID.Valid || *fresh
 	if snapshotNeedsBootstrap {
+		if task.WorkDir == "" {
+			fmt.Fprintf(os.Stderr, "error: task %q has no work_dir\n", task.Slug)
+			return 1
+		}
 		p, rc := bootstrapPromptForTask(db, task)
 		if rc != 0 {
 			return rc
@@ -232,10 +239,11 @@ func cmdDo(args []string) int {
 		}
 	}
 
-	// Step 2: atomic status flip inside a transaction. Captures preSessionID
-	// and other fields for later steps. Per spec §6 this commit is the
-	// durability boundary — even if bootstrap or iTerm spawn fails below,
-	// the task is already in 'in-progress'.
+	// Step 2: atomic status flip inside a transaction. Per spec §6 this
+	// commit is the durability boundary for the DB bind. Failures before
+	// commit roll back with the tx; post-commit fresh bootstrap/spawn
+	// failures make a guarded best-effort rollback of the fresh bind,
+	// while resume spawn failures preserve the existing session.
 	tx, err := db.Begin()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: begin tx: %v\n", err)
@@ -310,10 +318,6 @@ func cmdDo(args []string) int {
 		// work_dir" invariant holds by construction here — no
 		// extra column needed; future resumes spawn at work_dir
 		// and the transcript will be found.
-		expectedSessionID := ""
-		if curSessionID.Valid {
-			expectedSessionID = curSessionID.String
-		}
 		expectedPlaybookSlug := ""
 		if task.PlaybookSlug.Valid {
 			expectedPlaybookSlug = task.PlaybookSlug.String
@@ -326,14 +330,16 @@ func cmdDo(args []string) int {
 			 updated_at=?
 			 WHERE slug=?
 				   AND `+statusFilter+`
+				   AND archived_at IS NULL
 				   AND work_dir=?
 				   AND kind=?
 				   AND ((? = '' AND playbook_slug IS NULL) OR playbook_slug = ?)
+				   AND ((? = '' AND (harness IS NULL OR harness = '')) OR harness = ?)
 				   AND updated_at=?
 				   AND ((? = '' AND session_id IS NULL) OR session_id = ?)`,
 			now, sessionID, now, string(h.Name()), now, task.Slug,
 			task.WorkDir, task.Kind, expectedPlaybookSlug, expectedPlaybookSlug,
-			task.UpdatedAt, expectedSessionID, expectedSessionID,
+			expectedHarness, expectedHarness, task.UpdatedAt, expectedSessionID, expectedSessionID,
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: flip status: %v\n", err)
@@ -371,6 +377,10 @@ func cmdDo(args []string) int {
 
 	if *fresh && curSessionID.Valid {
 		fmt.Printf("--fresh: discarding old session %s\n", curSessionID.String)
+	}
+	if task.WorkDir == "" {
+		fmt.Fprintf(os.Stderr, "error: task %q has no work_dir\n", task.Slug)
+		return 1
 	}
 
 	// Look up project (may be nil).
@@ -412,7 +422,7 @@ func cmdDo(args []string) int {
 	if root := os.Getenv("FLOW_ROOT"); root != "" {
 		spawnEnv = map[string]string{"FLOW_ROOT": root}
 	}
-	if err := spawner.SpawnTab(buildTabTitle(project, task), cwd, command, spawnEnv); err != nil {
+	if err := spawner.SpawnTab(buildTabTitle(project, task), task.WorkDir, command, spawnEnv); err != nil {
 		if needsBootstrap {
 			// Spawn failed after the fresh bind. Undo both the
 			// session_id pre-allocation AND the status flip so the

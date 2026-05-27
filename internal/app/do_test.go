@@ -540,6 +540,176 @@ func TestCmdDoFreshConcurrentBindDuringPrepareRefuses(t *testing.T) {
 	}
 }
 
+func TestCmdDoFreshExistingSessionChangedDuringPrepareRefuses(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "fresh-existing-session-race")
+	spawns, _ := stubITerm(t)
+
+	db := openFlowDB(t)
+	original, err := flowdb.GetTask(db, "fresh-existing-session-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const oldSID = "old-session"
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, session_started=?, updated_at=? WHERE slug='fresh-existing-session-race'`,
+		oldSID, flowdb.NowISO(), original.UpdatedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) {
+		_, err := db.Exec(
+			`UPDATE tasks SET session_id=?, session_started=?, updated_at=? WHERE slug='fresh-existing-session-race'`,
+			"concurrent-rebind", flowdb.NowISO(), original.UpdatedAt,
+		)
+		return "prepared-but-stale-sid", err
+	}
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	if rc := cmdDo([]string{"fresh-existing-session-race", "--fresh"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+
+	task, err := flowdb.GetTask(db, "fresh-existing-session-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.SessionID.Valid || task.SessionID.String != "concurrent-rebind" {
+		t.Fatalf("session_id=%+v, want concurrent-rebind", task.SessionID)
+	}
+}
+
+func TestCmdDoResumeUsesWorkDirAfterTransactionReread(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "resume-reread-workdir")
+
+	oldWorkDir := t.TempDir()
+	newWorkDir := t.TempDir()
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET work_dir=?, session_id=?, session_started=?, updated_at=? WHERE slug='resume-reread-workdir'`,
+		oldWorkDir, "existing-session", flowdb.NowISO(), flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	oldPSRunner := claude.PSRunner
+	var mutated int64
+	claude.PSRunner = func() ([]byte, error) {
+		if atomic.CompareAndSwapInt64(&mutated, 0, 1) {
+			if _, err := db.Exec(
+				`UPDATE tasks SET work_dir=?, updated_at=? WHERE slug='resume-reread-workdir'`,
+				newWorkDir, flowdb.NowISO(),
+			); err != nil {
+				t.Fatalf("concurrent work_dir update: %v", err)
+			}
+		}
+		return []byte("  PID COMMAND\n"), nil
+	}
+	t.Cleanup(func() { claude.PSRunner = oldPSRunner })
+
+	_, getScript := stubITerm(t)
+	if rc := cmdDo([]string{"resume-reread-workdir"}); rc != 0 {
+		t.Fatalf("cmdDo rc=%d, want 0", rc)
+	}
+	if got := atomic.LoadInt64(&mutated); got != 1 {
+		t.Fatalf("PSRunner mutation count=%d, want 1", got)
+	}
+
+	script := getScript()
+	if !strings.Contains(script, " cd '"+newWorkDir+"' && ") {
+		t.Fatalf("resume spawn cwd did not use reselected work_dir %q; script:\n%s", newWorkDir, script)
+	}
+	if strings.Contains(script, " cd '"+oldWorkDir+"' && ") {
+		t.Fatalf("resume spawn used stale work_dir %q; script:\n%s", oldWorkDir, script)
+	}
+}
+
+func TestCmdDoFreshArchivedDuringPrepareRefuses(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "fresh-archive-race")
+	spawns, _ := stubITerm(t)
+
+	db := openFlowDB(t)
+	original, err := flowdb.GetTask(db, "fresh-archive-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) {
+		_, err := db.Exec(
+			`UPDATE tasks SET archived_at=?, updated_at=? WHERE slug='fresh-archive-race'`,
+			flowdb.NowISO(), original.UpdatedAt,
+		)
+		return "22222222-3333-4444-8555-888888888888", err
+	}
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	if rc := cmdDo([]string{"fresh-archive-race"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+
+	task, err := flowdb.GetTask(db, "fresh-archive-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.ArchivedAt.Valid {
+		t.Fatal("archived_at should preserve concurrent archive")
+	}
+	if task.SessionID.Valid {
+		t.Fatalf("session_id=%q, want NULL", task.SessionID.String)
+	}
+}
+
+func TestCmdDoFreshHarnessChangedDuringPrepareRefuses(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "fresh-harness-race")
+	spawns, _ := stubITerm(t)
+
+	db := openFlowDB(t)
+	original, err := flowdb.GetTask(db, "fresh-harness-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) {
+		_, err := db.Exec(
+			`UPDATE tasks SET harness=?, updated_at=? WHERE slug='fresh-harness-race'`,
+			"codex", original.UpdatedAt,
+		)
+		return "22222222-3333-4444-8555-999999999999", err
+	}
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	if rc := cmdDo([]string{"fresh-harness-race"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+
+	task, err := flowdb.GetTask(db, "fresh-harness-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.Harness.Valid || task.Harness.String != "codex" {
+		t.Fatalf("harness=%+v, want codex", task.Harness)
+	}
+	if task.SessionID.Valid {
+		t.Fatalf("session_id=%q, want NULL", task.SessionID.String)
+	}
+}
+
 func TestCmdDoFreshRollbackDoesNotClobberConcurrentStatusChange(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "rollback-race")
