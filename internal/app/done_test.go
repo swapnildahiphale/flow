@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"flow/internal/flowdb"
+	"flow/internal/harness"
 	"flow/internal/harness/claude"
 	"testing"
 )
@@ -13,6 +14,7 @@ import (
 // that previously asserted on slug now read it from the prompt (the
 // close-out template names the slug verbatim).
 type capturedClaudeCall struct {
+	ctx    harness.SessionContext
 	prompt string
 }
 
@@ -20,8 +22,8 @@ func stubClaudeRunner(t *testing.T, retErr error) *[]capturedClaudeCall {
 	t.Helper()
 	old := claude.SkipPermissionsRunner
 	calls := &[]capturedClaudeCall{}
-	claude.SkipPermissionsRunner = func(prompt string) error {
-		*calls = append(*calls, capturedClaudeCall{prompt: prompt})
+	claude.SkipPermissionsRunner = func(ctx harness.SessionContext, prompt string) error {
+		*calls = append(*calls, capturedClaudeCall{ctx: ctx, prompt: prompt})
 		return retErr
 	}
 	t.Cleanup(func() { claude.SkipPermissionsRunner = old })

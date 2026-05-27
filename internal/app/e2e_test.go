@@ -2,6 +2,7 @@ package app
 
 import (
 	"flow/internal/flowdb"
+	"flow/internal/harness"
 	"flow/internal/harness/claude"
 	"flow/internal/iterm"
 	"flow/internal/spawner"
@@ -47,7 +48,7 @@ func TestE2EFullRoundtrip(t *testing.T) {
 	// Stub the headless claude runner so cmdDone doesn't try to invoke
 	// the real claude CLI for its post-flip KB sweep.
 	oldClaude := claude.SkipPermissionsRunner
-	claude.SkipPermissionsRunner = func(prompt string) error { return nil }
+	claude.SkipPermissionsRunner = func(ctx harness.SessionContext, prompt string) error { return nil }
 	t.Cleanup(func() { claude.SkipPermissionsRunner = oldClaude })
 
 	// Pin the UUID `flow do` allocates so downstream assertions can

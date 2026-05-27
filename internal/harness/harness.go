@@ -9,12 +9,10 @@
 //     environment and keeps `flow do --here`'s discovery path symmetric
 //     with the first-spawn binding path.
 //
-//   - Every harness pre-allocates a session id from flow's perspective.
-//     Claude generates locally; codex/gemini probe their CLI (e.g.
-//     `codex exec` mints a session and prints the id, which the impl
-//     captures). Either way NewSessionID returns a real id, so flow's
-//     caller code has a single uniform spawn path — no deferred-bind
-//     branches, no FLOW_TASK env injection, no pending-spawn DB column.
+//   - Every harness owns its fresh-session lifecycle. Claude can prepare
+//     a deterministic launch command locally because it accepts
+//     --session-id; codex/gemini can allocate or bootstrap through their
+//     own CLI semantics while flow keeps SQLite write transactions short.
 //
 //   - Each harness owns its own transcript format end-to-end. Path
 //     layout AND on-disk schema differ per harness (claude jsonl with
@@ -25,6 +23,7 @@ package harness
 
 import (
 	"io"
+	"os"
 	"time"
 )
 
@@ -34,6 +33,7 @@ type Name string
 
 const (
 	NameClaude Name = "claude"
+	NameCodex  Name = "codex"
 )
 
 // InjectionMarker prefixes any first-user-message text injected via
@@ -55,6 +55,23 @@ type LaunchOpts struct {
 	Inject string
 }
 
+type SessionContext struct {
+	WorkDir string
+	Env     []string
+}
+
+func (ctx SessionContext) EnvOrDefault() []string {
+	if ctx.Env != nil {
+		return ctx.Env
+	}
+	return os.Environ()
+}
+
+type PreparedSession struct {
+	SessionID     string
+	LaunchCommand string
+}
+
 // Harness is the contract every agent-CLI adapter implements.
 type Harness interface {
 	// Identity ---------------------------------------------------------
@@ -72,15 +89,6 @@ type Harness interface {
 	// (e.g. "CLAUDE_CODE_SESSION_ID"). Flow reads this; it never sets
 	// it.
 	SessionIDEnvVar() string
-
-	// Session allocation -----------------------------------------------
-
-	// NewSessionID returns the session id flow should claim before
-	// spawning. Implementations either generate locally (claude
-	// synthesizes a v4 UUID) or probe the harness (codex/gemini exec
-	// a one-shot to mint and capture an id). Always returns a real
-	// id on success — flow's caller has a single uniform spawn path.
-	NewSessionID() (string, error)
 
 	// ValidateSessionID rejects strings that can't be a session id for
 	// this harness. Used by `flow do --here` to gate the env-var-
@@ -106,14 +114,18 @@ type Harness interface {
 	// should return nil unconditionally.
 	ValidateSession(workDir, sessionID string) error
 
-	// Launching --------------------------------------------------------
+	// Fresh session lifecycle ------------------------------------------
 
-	// LaunchCmd builds the shell command to start a fresh session
-	// with the given session id. For claude this is `--session-id
-	// <id>`; for codex/gemini it's a resume of the id minted during
-	// NewSessionID. The returned string is fed verbatim to
-	// spawner.SpawnTab.
-	LaunchCmd(sessionID, prompt string, opts LaunchOpts) string
+	// PrepareFreshSession performs any fresh-session allocation needed
+	// before flow opens its SQLite write transaction and returns the
+	// session id plus eventual launch command.
+	PrepareFreshSession(ctx SessionContext, prompt string, opts LaunchOpts) (PreparedSession, error)
+
+	// BootstrapFreshSession performs any post-commit bootstrap work
+	// needed before spawning the interactive session.
+	BootstrapFreshSession(ctx SessionContext, sessionID, prompt string, opts LaunchOpts) error
+
+	// Launching --------------------------------------------------------
 
 	// ResumeCmd builds the shell command to continue an existing
 	// session by id. opts.Inject (if any) is appended as the first
@@ -124,7 +136,7 @@ type Harness interface {
 	// the harness with per-tool approvals auto-allowed (used by
 	// `flow done`'s close-out sweep). Stdout/stderr are discarded;
 	// only the exit code matters.
-	SkipPermissionsRun(prompt string) error
+	SkipPermissionsRun(ctx SessionContext, prompt string) error
 
 	// Live-session detection -------------------------------------------
 

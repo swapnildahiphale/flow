@@ -173,6 +173,18 @@ func cmdDo(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
+
+	cwd := task.WorkDir
+	if cwd == "" {
+		fmt.Fprintf(os.Stderr, "error: task %q has no work_dir\n", task.Slug)
+		return 1
+	}
+	launchOpts := harness.LaunchOpts{
+		SkipPermissions: *dangerSkip,
+		Inject:          injectionText,
+	}
+	sessionCtx := harness.SessionContext{WorkDir: task.WorkDir, Env: os.Environ()}
+
 	if !*force && task.SessionID.Valid && task.SessionID.String != "" {
 		if live, err := h.LiveSessionIDs(); err == nil {
 			if n := live[strings.ToLower(task.SessionID.String)]; n > 0 {
@@ -194,6 +206,22 @@ func cmdDo(args []string) int {
 					task.Slug, h.Binary(), task.SessionID.String)
 				return 1
 			}
+		}
+	}
+
+	var prompt string
+	var prepared harness.PreparedSession
+	snapshotNeedsBootstrap := !task.SessionID.Valid || *fresh
+	if snapshotNeedsBootstrap {
+		p, rc := bootstrapPromptForTask(db, task)
+		if rc != 0 {
+			return rc
+		}
+		prompt = p
+		prepared, err = h.PrepareFreshSession(sessionCtx, prompt, launchOpts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: prepare session: %v\n", err)
+			return 1
 		}
 	}
 
@@ -232,9 +260,8 @@ func cmdDo(args []string) int {
 
 	// Decide bootstrap vs resume based on the row we re-read inside the tx.
 	// Fresh bootstrap means: either the task has no session_id, or --fresh
-	// was passed. In both cases we allocate a new UUID here and claim it
-	// in the DB via the status-flip UPDATE below — so the jsonl file claude
-	// writes is identified deterministically by us, not scraped afterwards.
+	// was passed. In both cases we use the session prepared before the
+	// transaction and claim it in the DB via the status-flip UPDATE below.
 	var curSessionID sql.NullString
 	if err := tx.QueryRow(`SELECT session_id FROM tasks WHERE slug=?`, task.Slug).Scan(&curSessionID); err != nil {
 		fmt.Fprintf(os.Stderr, "error: re-read session_id: %v\n", err)
@@ -242,13 +269,14 @@ func cmdDo(args []string) int {
 	}
 	needsBootstrap := !curSessionID.Valid || *fresh
 	var sessionID string
-	if needsBootstrap {
-		id, err := h.NewSessionID()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: allocate session id: %v\n", err)
-			return 1
-		}
-		sessionID = id
+	if needsBootstrap && !snapshotNeedsBootstrap {
+		fmt.Fprintf(os.Stderr, "error: task %q session changed while preparing; retry flow do\n", task.Slug)
+		return 1
+	}
+	if !needsBootstrap && snapshotNeedsBootstrap {
+		sessionID = curSessionID.String
+	} else if needsBootstrap {
+		sessionID = prepared.SessionID
 	} else {
 		sessionID = curSessionID.String
 	}
@@ -262,12 +290,10 @@ func cmdDo(args []string) int {
 		// they're issued from a different ambient harness or no
 		// harness at all.
 		//
-		// COALESCE on the harness column: write only when currently
-		// NULL/empty. The column is "set once on first bind"
-		// (per the doc comment in flowdb/db.go) — the bootstrap
-		// path should never silently overwrite a pre-existing pin.
-		// `flow do --here --force` is the explicit lane for harness
-		// switches and writes the column unconditionally there.
+		// The compare-and-swap predicate below is evaluated against
+		// the transaction snapshot, so a concurrent session mutation
+		// cannot be overwritten silently. `flow do --fresh` is the
+		// explicit lane for replacing an existing fresh bind.
 		//
 		// Note on cwd: bootstrap spawns the new tab with
 		// cwd=task.WorkDir, so the harness writes its transcript
@@ -275,16 +301,28 @@ func cmdDo(args []string) int {
 		// work_dir" invariant holds by construction here — no
 		// extra column needed; future resumes spawn at work_dir
 		// and the transcript will be found.
-		if _, err := tx.Exec(
+		expectedSessionID := ""
+		if curSessionID.Valid {
+			expectedSessionID = curSessionID.String
+		}
+		res, err := tx.Exec(
 			`UPDATE tasks SET status='in-progress',
 			 status_changed_at = CASE WHEN status != 'in-progress' THEN ? ELSE status_changed_at END,
 			 session_id=?, session_started=?,
-			 harness = CASE WHEN harness IS NULL OR harness = '' THEN ? ELSE harness END,
+			 harness=?,
 			 updated_at=?
-			 WHERE slug=? AND `+statusFilter,
+			 WHERE slug=?
+			   AND `+statusFilter+`
+			   AND ((? = '' AND session_id IS NULL) OR session_id = ?)`,
 			now, sessionID, now, string(h.Name()), now, task.Slug,
-		); err != nil {
+			expectedSessionID, expectedSessionID,
+		)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: flip status: %v\n", err)
+			return 1
+		}
+		if affected, _ := res.RowsAffected(); affected == 0 {
+			fmt.Fprintf(os.Stderr, "error: task %q changed concurrently; retry flow do\n", task.Slug)
 			return 1
 		}
 	} else {
@@ -328,12 +366,6 @@ func cmdDo(args []string) int {
 		project = p
 	}
 
-	cwd := task.WorkDir
-	if cwd == "" {
-		fmt.Fprintf(os.Stderr, "error: task %q has no work_dir\n", task.Slug)
-		return 1
-	}
-
 	// Spawn the tab via the active harness adapter.
 	//
 	// The skill on disk (e.g. ~/.claude/skills/flow/SKILL.md for the
@@ -341,35 +373,13 @@ func cmdDo(args []string) int {
 	// `flow skill install` / `flow skill update`. To refresh it after
 	// upgrading flow, the user runs `flow skill update` manually.
 	var command string
-	launchOpts := harness.LaunchOpts{
-		SkipPermissions: *dangerSkip,
-		Inject:          injectionText,
-	}
 	if needsBootstrap {
-		// Fresh bootstrap path. For pre-allocating harnesses (claude),
-		// PrepareSpawn already minted the sessionID and the status flip
-		// above committed it, so the harness can embed it in the spawn
-		// command (e.g. `--session-id <uuid>`) for deterministic
-		// transcript paths. For self-allocating harnesses sessionID will
-		// be empty — the SessionStart hook completes the binding later.
-		playbookSlug := ""
-		isFirstRun := false
-		if task.PlaybookSlug.Valid {
-			playbookSlug = task.PlaybookSlug.String
-			// First run = this is the only non-archived run-task for the
-			// playbook. The current run row was just inserted by
-			// cmdRunPlaybook, so a count of 1 means no prior runs exist.
-			var runCount int
-			if err := db.QueryRow(
-				`SELECT COUNT(*) FROM tasks WHERE playbook_slug = ? AND kind = 'playbook_run' AND archived_at IS NULL`,
-				playbookSlug,
-			).Scan(&runCount); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: count playbook runs: %v\n", err)
-			}
-			isFirstRun = runCount <= 1
+		if err := h.BootstrapFreshSession(sessionCtx, sessionID, prompt, launchOpts); err != nil {
+			rollbackFreshSessionBind(db, task.Slug, sessionID)
+			fmt.Fprintf(os.Stderr, "error: bootstrap session: %v\n", err)
+			return 1
 		}
-		prompt := buildBootstrapPromptForKindV2(task.Slug, task.Kind, playbookSlug, isFirstRun)
-		command = h.LaunchCmd(sessionID, prompt, launchOpts)
+		command = prepared.LaunchCommand
 	} else {
 		// Resume path: the UUID we already have in the DB is what the
 		// harness used when it first wrote its transcript.
@@ -386,9 +396,9 @@ func cmdDo(args []string) int {
 	}
 	if err := spawner.SpawnTab(buildTabTitle(project, task), cwd, command, spawnEnv); err != nil {
 		if needsBootstrap {
-			// Spawn failed before claude could write its jsonl. Undo
-			// both the session_id pre-allocation AND the status flip
-			// so the next `flow do` retries bootstrap fresh. The
+			// Spawn failed after the fresh bind. Undo both the
+			// session_id pre-allocation AND the status flip so the
+			// next `flow do` retries bootstrap fresh. The
 			// session-id invariant (in-progress requires session_id)
 			// makes "preserve status, drop session_id" illegal —
 			// rolling status back to backlog is the only consistent
@@ -397,18 +407,7 @@ func cmdDo(args []string) int {
 			// The WHERE clause guards against a concurrent `flow do`
 			// having mutated session_id between commit and now —
 			// only roll back if we still own the session.
-			if _, undoErr := db.Exec(
-				`UPDATE tasks SET
-					session_id        = NULL,
-					session_started   = NULL,
-					status            = 'backlog',
-					status_changed_at = NULL,
-					updated_at        = ?
-				 WHERE slug=? AND session_id=?`,
-				flowdb.NowISO(), task.Slug, sessionID,
-			); undoErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: rollback pre-allocated session after spawn failure: %v\n", undoErr)
-			}
+			rollbackFreshSessionBind(db, task.Slug, sessionID)
 		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -438,6 +437,38 @@ func cmdDo(args []string) int {
 		fmt.Printf("Resumed %s (session %s)\n", task.Slug, sessionID)
 	}
 	return 0
+}
+
+func rollbackFreshSessionBind(db *sql.DB, slug, sessionID string) {
+	if _, err := db.Exec(
+		`UPDATE tasks SET
+			session_id        = NULL,
+			session_started   = NULL,
+			status            = 'backlog',
+			status_changed_at = NULL,
+			updated_at        = ?
+		 WHERE slug=? AND session_id=?`,
+		flowdb.NowISO(), slug, sessionID,
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: rollback fresh session bind: %v\n", err)
+	}
+}
+
+func bootstrapPromptForTask(db *sql.DB, task *flowdb.Task) (string, int) {
+	playbookSlug := ""
+	isFirstRun := false
+	if task.PlaybookSlug.Valid {
+		playbookSlug = task.PlaybookSlug.String
+		var runCount int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM tasks WHERE playbook_slug = ? AND kind = 'playbook_run' AND archived_at IS NULL`,
+			playbookSlug,
+		).Scan(&runCount); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: count playbook runs: %v\n", err)
+		}
+		isFirstRun = runCount <= 1
+	}
+	return buildBootstrapPromptForKindV2(task.Slug, task.Kind, playbookSlug, isFirstRun), 0
 }
 
 // buildBootstrapPromptForKind dispatches to the right prompt variant

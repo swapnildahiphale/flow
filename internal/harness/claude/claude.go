@@ -22,7 +22,7 @@ import (
 // Package-level seams. Tests in other packages swap these to avoid
 // spawning real subprocesses.
 //
-//	NewUUID                — session UUID minted by NewSessionID.
+//	NewUUID                — session UUID minted by PrepareFreshSession.
 //	SkipPermissionsRunner  — invocation of `claude -p` for the
 //	                         close-out sweep.
 //	PSRunner               — `ps -axo pid,command` output used by
@@ -31,10 +31,12 @@ import (
 // Use t.Cleanup to restore after stubbing, exactly as iterm.Runner is
 // stubbed in the existing tests.
 var (
-	NewUUID               = newUUID
-	SkipPermissionsRunner = runSkipPermissions
-	PSRunner              = runPS
+	NewUUID                          = newUUID
+	SkipPermissionsRunner SkipRunner = runSkipPermissions
+	PSRunner                         = runPS
 )
+
+type SkipRunner func(ctx harness.SessionContext, prompt string) error
 
 const (
 	// SessionStart matcher for ~/.claude/settings.json. Stable —
@@ -64,14 +66,19 @@ var sessionIDRe = regexp.MustCompile(
 	`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
 )
 
-// NewSessionID generates a v4 UUID locally. flow's caller writes it
-// to tasks.session_id before spawning so `claude --session-id <uuid>`
-// produces a transcript at a deterministic path. (Codex/Gemini will
-// implement this by probing the harness CLI to mint and capture an
-// id; claude doesn't need that — it accepts an externally-supplied
-// UUID via --session-id.)
-func (c *claude) NewSessionID() (string, error) {
-	return NewUUID()
+func (c *claude) PrepareFreshSession(ctx harness.SessionContext, prompt string, opts harness.LaunchOpts) (harness.PreparedSession, error) {
+	id, err := NewUUID()
+	if err != nil {
+		return harness.PreparedSession{}, err
+	}
+	return harness.PreparedSession{
+		SessionID:     id,
+		LaunchCommand: c.LaunchCmd(id, prompt, opts),
+	}, nil
+}
+
+func (c *claude) BootstrapFreshSession(ctx harness.SessionContext, sessionID, prompt string, opts harness.LaunchOpts) error {
+	return nil
 }
 
 func (c *claude) ValidateSessionID(s string) error {
@@ -154,16 +161,18 @@ func (c *claude) ResumeCmd(sessionID string, opts harness.LaunchOpts) string {
 
 // ---------- headless ----------
 
-func (c *claude) SkipPermissionsRun(prompt string) error {
-	return SkipPermissionsRunner(prompt)
+func (c *claude) SkipPermissionsRun(ctx harness.SessionContext, prompt string) error {
+	return SkipPermissionsRunner(ctx, prompt)
 }
 
 // runSkipPermissions is the default SkipPermissionsRunner — execs
 // `claude -p <prompt> --dangerously-skip-permissions`. Stdout/stderr
 // are discarded because the sweep prompt instructs claude to write
 // files silently with no chat output.
-func runSkipPermissions(prompt string) error {
+func runSkipPermissions(ctx harness.SessionContext, prompt string) error {
 	cmd := exec.Command("claude", "-p", prompt, "--dangerously-skip-permissions")
+	cmd.Dir = ctx.WorkDir
+	cmd.Env = ctx.EnvOrDefault()
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	return cmd.Run()

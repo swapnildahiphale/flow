@@ -101,7 +101,7 @@ func TestEncodeCwd(t *testing.T) {
 // pre-refactor do.go was producing — same flag order, same quoting,
 // same trailing --dangerously-skip-permissions placement.
 func TestLaunchCmd_PreservesByteIdentity(t *testing.T) {
-	h := New()
+	h := &claude{}
 	sessionID := "658bf2be-5ae3-4842-a8a4-e0d0b785514d"
 	prompt := "do the thing"
 
@@ -126,6 +126,26 @@ func TestLaunchCmd_PreservesByteIdentity(t *testing.T) {
 	}
 }
 
+func TestPrepareFreshSessionUsesGeneratedUUIDAndLaunchCommand(t *testing.T) {
+	orig := NewUUID
+	t.Cleanup(func() { NewUUID = orig })
+	NewUUID = func() (string, error) {
+		return "658bf2be-5ae3-4842-a8a4-e0d0b785514d", nil
+	}
+
+	got, err := New().PrepareFreshSession(harness.SessionContext{WorkDir: "/tmp/work"}, "do the thing", harness.LaunchOpts{SkipPermissions: true})
+	if err != nil {
+		t.Fatalf("PrepareFreshSession: %v", err)
+	}
+	if got.SessionID != "658bf2be-5ae3-4842-a8a4-e0d0b785514d" {
+		t.Fatalf("SessionID=%q", got.SessionID)
+	}
+	want := "claude --session-id 658bf2be-5ae3-4842-a8a4-e0d0b785514d 'do the thing' --dangerously-skip-permissions"
+	if got.LaunchCommand != want {
+		t.Fatalf("LaunchCommand=\n%q\nwant\n%q", got.LaunchCommand, want)
+	}
+}
+
 func TestResumeCmd_PreservesByteIdentity(t *testing.T) {
 	h := New()
 	sessionID := "658bf2be-5ae3-4842-a8a4-e0d0b785514d"
@@ -146,6 +166,30 @@ func TestResumeCmd_PreservesByteIdentity(t *testing.T) {
 	want = "claude --resume " + sessionID + " '" + harness.InjectionMarker + "\nfollow up'"
 	if got != want {
 		t.Errorf("ResumeCmd inject:\n got=%q\nwant=%q", got, want)
+	}
+}
+
+func TestSkipPermissionsRunReceivesSessionContext(t *testing.T) {
+	orig := SkipPermissionsRunner
+	t.Cleanup(func() { SkipPermissionsRunner = orig })
+
+	var gotCtx harness.SessionContext
+	var gotPrompt string
+	SkipPermissionsRunner = func(ctx harness.SessionContext, prompt string) error {
+		gotCtx = ctx
+		gotPrompt = prompt
+		return nil
+	}
+
+	ctx := harness.SessionContext{WorkDir: "/tmp/work", Env: []string{"FLOW_ROOT=/tmp/flow-root"}}
+	if err := New().SkipPermissionsRun(ctx, "sweep"); err != nil {
+		t.Fatal(err)
+	}
+	if gotCtx.WorkDir != "/tmp/work" || len(gotCtx.Env) != 1 || gotCtx.Env[0] != "FLOW_ROOT=/tmp/flow-root" {
+		t.Fatalf("ctx=%+v", gotCtx)
+	}
+	if gotPrompt != "sweep" {
+		t.Fatalf("prompt=%q", gotPrompt)
 	}
 }
 

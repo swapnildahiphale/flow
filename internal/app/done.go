@@ -2,6 +2,7 @@ package app
 
 import (
 	"flow/internal/flowdb"
+	"flow/internal/harness"
 	"fmt"
 	"os"
 )
@@ -97,11 +98,15 @@ func cmdDone(args []string) int {
 			// contract; the sweep is best-effort).
 			fmt.Println()
 			fmt.Fprintf(os.Stderr, "warning: close-out sweep skipped: %v\n", lookupErr)
-		} else if err := h.SkipPermissionsRun(buildCloseoutSweepPrompt(task.Slug, projectSlug)); err != nil {
-			fmt.Println()
-			fmt.Fprintf(os.Stderr, "warning: close-out sweep failed: %v\n", err)
 		} else {
-			fmt.Println(" done")
+			ctx := harness.SessionContext{WorkDir: task.WorkDir, Env: os.Environ()}
+			err := h.SkipPermissionsRun(ctx, buildCloseoutSweepPrompt(task.Slug, projectSlug))
+			if err != nil {
+				fmt.Println()
+				fmt.Fprintf(os.Stderr, "warning: close-out sweep failed: %v\n", err)
+			} else {
+				fmt.Println(" done")
+			}
 		}
 	}
 	return 0
