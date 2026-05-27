@@ -430,6 +430,58 @@ func TestCmdDoHarnessCodexFreshAllocatesBootstrapsAndSpawns(t *testing.T) {
 	if !strings.Contains(script, "codex resume 018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40") {
 		t.Fatalf("spawn script missing codex resume: %s", script)
 	}
+	if !strings.Contains(script, "FLOW_ROOT=") || !strings.Contains(script, root) {
+		t.Fatalf("spawn script missing FLOW_ROOT propagation; got:\n%s", script)
+	}
+}
+
+func TestCmdDoFreshHarnessCodexReplacesPinnedClaudeTask(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "codex-repin")
+	_, getScript := stubITerm(t)
+
+	const oldSID = "11111111-2222-4333-8444-555555555555"
+	const newSID = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET harness='claude', session_id=?, session_started=?, updated_at=? WHERE slug='codex-repin'`,
+		oldSID, flowdb.NowISO(), flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+		switch call {
+		case 1:
+			return []byte(`{"type":"thread.started","thread":{"thread_id":"` + newSID + `"}}` + "\n"), nil
+		case 2:
+			return nil, nil
+		default:
+			t.Fatalf("unexpected codex call %d: %q", call, args)
+			return nil, nil
+		}
+	})
+
+	if rc := cmdDo([]string{"codex-repin", "--fresh", "--harness", "codex"}); rc != 0 {
+		t.Fatalf("cmdDo rc=%d", rc)
+	}
+
+	task, err := flowdb.GetTask(db, "codex-repin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.Harness.Valid || task.Harness.String != "codex" {
+		t.Fatalf("harness=%+v, want codex", task.Harness)
+	}
+	if !task.SessionID.Valid || task.SessionID.String != newSID {
+		t.Fatalf("session_id=%+v, want %s", task.SessionID, newSID)
+	}
+	if strings.Contains(getScript(), oldSID) {
+		t.Fatalf("spawn script used old pinned session: %s", getScript())
+	}
+	if !strings.Contains(getScript(), "codex resume "+newSID) {
+		t.Fatalf("spawn script missing new codex resume: %s", getScript())
+	}
 }
 
 func TestCmdDoHarnessCodexBootstrapFailureRollsBackFreshBind(t *testing.T) {
@@ -944,6 +996,38 @@ func TestCmdDoResumeSessionChangedDuringLiveCheckRefuses(t *testing.T) {
 	}
 	if !task.Harness.Valid || task.Harness.String != "codex" {
 		t.Fatalf("harness=%+v, want codex", task.Harness)
+	}
+}
+
+func TestCmdDoCodexResumeWithInjectsInstructionBeforeInteractiveResume(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "codex-resume")
+	_, getScript := stubITerm(t)
+
+	const sid = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET harness='codex', session_id=?, session_started=?, updated_at=? WHERE slug='codex-resume'`,
+		sid, flowdb.NowISO(), flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+		t.Fatalf("resume path should not run codex exec through CommandRunner; call=%d args=%q", call, args)
+		return nil, nil
+	})
+
+	if rc := cmdDo([]string{"codex-resume", "--with", "check deploy status"}); rc != 0 {
+		t.Fatalf("cmdDo rc=%d", rc)
+	}
+
+	script := getScript()
+	wantInject := "codex exec resume --skip-git-repo-check " + sid + " '[via flow do --with]\ncheck deploy status'"
+	wantResume := "codex resume " + sid
+	injectAt := strings.Index(script, wantInject)
+	resumeAt := strings.Index(script, wantResume)
+	if injectAt < 0 || resumeAt < 0 || injectAt > resumeAt {
+		t.Fatalf("spawn script missing ordered codex inject/resume:\nwant inject: %q\nwant resume: %q\ngot:\n%s", wantInject, wantResume, script)
 	}
 }
 
@@ -1587,6 +1671,64 @@ func TestCmdDoHereHappyPath(t *testing.T) {
 	}
 	if task.Status != "in-progress" {
 		t.Errorf("status = %q, want in-progress", task.Status)
+	}
+}
+
+func TestCmdDoHereCodexBindsCodeThreadID(t *testing.T) {
+	setupFlowRoot(t)
+	seedTaskAtCwd(t, "codex-here")
+	const sid = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
+	t.Setenv("CODEX_THREAD_ID", sid)
+	count, _ := stubITerm(t)
+
+	if rc := cmdDo([]string{"codex-here", "--here", "--harness", "codex"}); rc != 0 {
+		t.Fatalf("cmdDo --here codex rc=%d", rc)
+	}
+	if *count != 0 {
+		t.Fatalf("--here should not spawn; got %d spawns", *count)
+	}
+
+	db := openFlowDB(t)
+	task, err := flowdb.GetTask(db, "codex-here")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Harness.String != "codex" || task.SessionID.String != sid {
+		t.Fatalf("task harness/session=%q/%q, want codex/%s", task.Harness.String, task.SessionID.String, sid)
+	}
+}
+
+func TestCmdDoHereExplicitCodexRequiresCodexThreadID(t *testing.T) {
+	setupFlowRoot(t)
+	seedTaskAtCwd(t, "codex-here-missing")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "f00ba111-2222-4333-8444-555555555555")
+	t.Setenv("CODEX_THREAD_ID", "")
+
+	stderr := captureStderr(t)
+	rc := cmdDo([]string{"codex-here-missing", "--here", "--harness", "codex"})
+	if rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "requires $CODEX_THREAD_ID") {
+		t.Fatalf("stderr=%q", got)
+	}
+}
+
+func TestCmdDoHereAmbiguousEnvRequiresHarness(t *testing.T) {
+	setupFlowRoot(t)
+	seedTaskAtCwd(t, "ambiguous-here")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "f00ba111-2222-4333-8444-555555555555")
+	t.Setenv("CODEX_THREAD_ID", "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40")
+
+	stderr := captureStderr(t)
+	rc := cmdDo([]string{"ambiguous-here", "--here"})
+	if rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "multiple harness session env vars") || !strings.Contains(got, "pass --harness") {
+		t.Fatalf("stderr=%q", got)
 	}
 }
 

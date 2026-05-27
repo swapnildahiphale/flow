@@ -69,6 +69,46 @@ func TestTranscriptCmdNoRefAmbiguousHarnessEnvMessage(t *testing.T) {
 	}
 }
 
+func TestTranscriptNoRefAmbiguousAmbientErrors(t *testing.T) {
+	setupFlowRoot(t)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "658bf2be-5ae3-4842-a8a4-e0d0b785514d")
+	t.Setenv("CODEX_THREAD_ID", "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40")
+
+	stderr := captureStderr(t)
+	rc := cmdTranscript(nil)
+	if rc != 2 {
+		t.Fatalf("rc=%d, want 2", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "multiple harness session env vars") || !strings.Contains(got, "pass a task ref explicitly") {
+		t.Fatalf("stderr=%q", got)
+	}
+}
+
+func TestTranscriptNoRefCodexAmbient(t *testing.T) {
+	setupFlowRoot(t)
+	seedTaskAtCwd(t, "codex-transcript")
+	const sid = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET harness='codex', session_id=?, session_started=?, status='in-progress', updated_at=? WHERE slug='codex-transcript'`,
+		sid, flowdb.NowISO(), flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_THREAD_ID", sid)
+
+	stderr := captureStderr(t)
+	rc := cmdTranscript(nil)
+	if rc != 1 {
+		t.Fatalf("rc=%d, want 1 until codex transcript rendering lands", rc)
+	}
+	got := stderr()
+	if !strings.Contains(got, "codex transcript rendering is not wired yet") {
+		t.Fatalf("stderr=%q", got)
+	}
+}
+
 func TestTranscriptCmdWithSession(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLOW_ROOT", filepath.Join(tmp, "flow"))

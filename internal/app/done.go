@@ -8,12 +8,12 @@ import (
 )
 
 // cmdDone marks a task done. Per spec §5.3 this is a single UPDATE that
-// does NOT touch the iTerm tab, kill the Claude session, or clear
+// does NOT touch the terminal tab, kill the harness session, or clear
 // session_id — the session can still be resumed via `flow do` after
 // manually reopening the task if the user ever needs to.
 //
 // After the status flip, if the task has a session_id, done synchronously
-// spawns a single headless `claude -p` session that loads the flow skill,
+// spawns a single headless harness run that loads the flow skill,
 // reads the task's transcript, and runs a two-part close-out sweep:
 //  1. KB scoop per §4.10 → ~/.flow/kb/*.md.
 //  2. If the task is attached to a project, optionally write one
@@ -24,7 +24,7 @@ import (
 //     purely-mechanical sessions yield no file.
 //
 // The CLI prints "updating kbs, project updates..." while it waits.
-// A failed sweep (missing claude binary, non-zero exit) only emits a
+// A failed sweep (missing harness binary, non-zero exit) only emits a
 // warning — the status flip is the contract; the sweep is best-effort.
 func cmdDone(args []string) int {
 	if len(args) == 0 {
@@ -62,7 +62,7 @@ func cmdDone(args []string) int {
 		fmt.Fprintf(os.Stderr,
 			"error: task %q has no session_id — flow done requires at least one prior `flow do` (or `flow do --here`) to have attached a session whose transcript the sweep can read.\n"+
 				"  options:\n"+
-				"    - if you've been working on this task in the current Claude session, bind it now and retry close-out:\n"+
+				"    - if you've been working on this task in the current harness session, bind it now and retry close-out:\n"+
 				"        flow do --here %s   (then re-run: flow done %s)\n"+
 				"    - if it was never worked on and isn't relevant, archive it instead:\n"+
 				"        flow archive %s\n",
@@ -114,7 +114,7 @@ func cmdDone(args []string) int {
 
 // buildCloseoutSweepPrompt composes the headless prompt that drives
 // the post-done close-out sweep. The prompt is passed as a single
-// positional arg to `claude -p` via exec.Command — no shell
+// positional arg to the selected harness runner — no shell
 // interpolation, so any characters are safe.
 //
 // Two responsibilities, executed in order by the same headless session:
@@ -153,7 +153,7 @@ func buildCloseoutSweepPrompt(slug, projectSlug string) string {
 			"## Steps\n\n"+
 			"1. Invoke the flow skill via the Skill tool. This loads §4.10 (KB rules) and §4.5 (update-file shape).\n\n"+
 			"2. Run: flow transcript %s\n"+
-			"   This prints the conversation transcript from the task's Claude session. Read it carefully end to end.\n\n"+
+			"   This prints the conversation transcript from the task's harness session. Read it carefully end to end.\n\n"+
 			"3. KB sweep — strict bar, distill the essence.\n\n"+
 			"   For each of these five files, ask: across the WHOLE transcript, is there a durable fact about the user, their org, products, processes, or business that belongs there per §4.10's bucket table AND meets ALL three bars below?\n"+
 			"     - %s/kb/user.md\n"+
@@ -164,7 +164,7 @@ func buildCloseoutSweepPrompt(slug, projectSlug string) string {
 			"   The three bars (ALL must be met):\n"+
 			"     a. **Durable** — still true / still relevant in three months. Not 'today I felt X', not 'we tried approach Y for this one PR'.\n"+
 			"     b. **Surprising or non-obvious** — not derivable from the code, the README, or what a sibling task would already know.\n"+
-			"     c. **Future-relevant** — a future Claude session would change a decision because of it. If you can't picture that, skip.\n\n"+
+			"     c. **Future-relevant** — a future assistant session would change a decision because of it. If you can't picture that, skip.\n\n"+
 			"   Most task transcripts contribute nothing to the KB. Mechanical work, narrow bug fixes, local refactors, routine debugging — these almost never produce KB entries. The expected answer for most files on most tasks is 'no'. Don't reach.\n\n"+
 			"4. Writing KB entries — INTERPRET the essence; do not transcribe.\n\n"+
 			"   This is the close-out mode of §4.10 and is DIFFERENT from real-time scoop. In real-time scoop you capture what the user just said, mostly verbatim, because it's a single fresh fact. Here you've read the whole conversation — your job is to SYNTHESIZE: pull out the durable insight in compact paraphrase, in your own words, capturing the essence and (where helpful) the why. Avoid quote dumps. One concise dated bullet per insight.\n\n"+

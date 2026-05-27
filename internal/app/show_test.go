@@ -184,6 +184,21 @@ func TestCmdShowTaskAmbiguousDefault(t *testing.T) {
 	}
 }
 
+func TestShowTaskNoRefAmbiguousAmbientErrors(t *testing.T) {
+	_, _ = showListEditDB(t)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "deadbeef-1111-4222-8333-444455556666")
+	t.Setenv("CODEX_THREAD_ID", "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40")
+
+	out := captureStdout(t, func() {
+		if rc := cmdShow([]string{"task"}); rc != 1 {
+			t.Errorf("rc=%d, want 1", rc)
+		}
+	})
+	if !strings.Contains(out, "multiple harness session env vars") || !strings.Contains(out, "pass a task ref explicitly") {
+		t.Errorf("missing ambiguity hint; out=%q", out)
+	}
+}
+
 func TestCmdShowTaskUnknown(t *testing.T) {
 	_, _ = showListEditDB(t)
 	out := captureStdout(t, func() {
