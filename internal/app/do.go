@@ -281,7 +281,8 @@ func cmdDo(args []string) int {
 		return 1
 	}
 	if !needsBootstrap && snapshotNeedsBootstrap {
-		sessionID = curSessionID.String
+		fmt.Fprintf(os.Stderr, "error: task %q changed concurrently; retry flow do\n", task.Slug)
+		return 1
 	} else if needsBootstrap {
 		sessionID = prepared.SessionID
 	} else {

@@ -464,6 +464,41 @@ func TestCmdDoFreshDetectsTaskChangedDuringPrepare(t *testing.T) {
 	}
 }
 
+func TestCmdDoFreshConcurrentBindDuringPrepareRefuses(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "concurrent-bind")
+	spawns, _ := stubITerm(t)
+
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) {
+		db := openFlowDB(t)
+		defer db.Close()
+		_, err := db.Exec(
+			`UPDATE tasks SET session_id=?, session_started=?, updated_at=? WHERE slug='concurrent-bind'`,
+			"concurrent-sid", flowdb.NowISO(), flowdb.NowISO(),
+		)
+		return "prepared-but-stale-sid", err
+	}
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	if rc := cmdDo([]string{"concurrent-bind"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+
+	db := openFlowDB(t)
+	defer db.Close()
+	task, err := flowdb.GetTask(db, "concurrent-bind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.SessionID.Valid || task.SessionID.String != "concurrent-sid" {
+		t.Fatalf("session_id=%+v, want concurrent-sid", task.SessionID)
+	}
+}
+
 func TestCmdDoFreshRollbackDoesNotClobberConcurrentStatusChange(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "rollback-race")
@@ -709,11 +744,11 @@ func TestCmdDoSpawnsClaudeNotFlowde(t *testing.T) {
 }
 
 // TestCmdDoConcurrentFreshTasks verifies two concurrent cmdDo calls on a
-// fresh task don't corrupt DB state. The BEGIN IMMEDIATE lock serializes
-// the txs: the winner allocates a UUID and writes it; the loser sees
-// session_id already set and falls through to the resume path (spawning
-// `claude --resume <winner-uuid>`). Both tabs end up pointing at the same
-// session — pre-existing documented race outcome, no lost UUIDs.
+// fresh task don't corrupt DB state. When both callers prepare from the
+// fresh snapshot, the loser now refuses and asks the user to retry rather
+// than leaking a prepared fresh session and resuming the winner's bind.
+// If one caller starts after the other commits, it may safely take the
+// normal resume path.
 func TestCmdDoConcurrentFreshTasks(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "race-task")
@@ -726,18 +761,26 @@ func TestCmdDoConcurrentFreshTasks(t *testing.T) {
 	go func() { defer wg.Done(); results[1] = cmdDo([]string{"race-task"}) }()
 	wg.Wait()
 
+	successes := 0
 	for i, rc := range results {
-		if rc != 0 {
-			t.Errorf("goroutine %d rc=%d", i, rc)
+		if rc == 0 {
+			successes++
+			continue
 		}
+		if rc != 1 {
+			t.Errorf("goroutine %d rc=%d, want 0 or stale-prepare retry rc 1", i, rc)
+		}
+	}
+	if successes == 0 {
+		t.Fatalf("expected at least one successful fresh bind, got results=%v", results)
 	}
 	db := openFlowDB(t)
 	task, _ := flowdb.GetTask(db, "race-task")
 	if !task.SessionID.Valid || task.SessionID.String == "" {
 		t.Errorf("session_id should be populated after races (got %+v)", task.SessionID)
 	}
-	if n := atomic.LoadInt64(spawns); n != 2 {
-		t.Errorf("iTerm spawn count=%d, want 2", n)
+	if n := atomic.LoadInt64(spawns); n != int64(successes) {
+		t.Errorf("iTerm spawn count=%d, want successes=%d", n, successes)
 	}
 }
 
