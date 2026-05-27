@@ -260,9 +260,9 @@ Before installing the Codex skill or hook, back up the real Codex
 integration files:
 
 ```bash
-mkdir -p /private/tmp/flow-codex-dev/backups
-cp -R ~/.agents/skills/flow /private/tmp/flow-codex-dev/backups/flow-skill 2>/dev/null || true
-cp ~/.codex/hooks.json /private/tmp/flow-codex-dev/backups/hooks.json 2>/dev/null || true
+ts=$(date +%Y%m%d%H%M%S)
+[ ! -e ~/.agents/skills/flow ] || cp -a ~/.agents/skills/flow ~/.agents/skills/flow.backup.$ts
+[ ! -e ~/.codex/hooks.json ] || cp -a ~/.codex/hooks.json ~/.codex/hooks.json.backup.$ts
 flow skill install --harness codex --force
 ```
 
