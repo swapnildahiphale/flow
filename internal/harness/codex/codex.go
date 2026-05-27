@@ -355,11 +355,24 @@ func mutateHook(command, event string, install bool) (bool, error) {
 	if file == nil {
 		file = map[string]any{}
 	}
-	hooks, _ := file["hooks"].(map[string]any)
-	if hooks == nil {
+	hooks := map[string]any{}
+	if rawHooks, exists := file["hooks"]; exists {
+		var ok bool
+		hooks, ok = rawHooks.(map[string]any)
+		if !ok {
+			return false, fmt.Errorf("parse %s: hooks must be an object", path)
+		}
+	} else if install {
 		hooks = map[string]any{}
 	}
-	entries, _ := hooks[event].([]any)
+	var entries []any
+	if rawEntries, exists := hooks[event]; exists {
+		var ok bool
+		entries, ok = rawEntries.([]any)
+		if !ok {
+			return false, fmt.Errorf("parse %s: hooks.%s must be an array", path, event)
+		}
+	}
 
 	changed := false
 	if install && hasCanonicalHookCommand(entries, command) && countHookCommands(entries, command) == 1 {
@@ -417,8 +430,13 @@ func removeHookCommand(entries []any, command string) ([]any, bool) {
 			kept = append(kept, entry)
 			continue
 		}
-		inner, _ := m["hooks"].([]any)
+		inner, ok := m["hooks"].([]any)
+		if !ok {
+			kept = append(kept, entry)
+			continue
+		}
 		filtered := make([]any, 0, len(inner))
+		entryChanged := false
 		for _, h := range inner {
 			hm, ok := h.(map[string]any)
 			if !ok {
@@ -427,15 +445,17 @@ func removeHookCommand(entries []any, command string) ([]any, bool) {
 			}
 			if cmd, _ := hm["command"].(string); strings.TrimSpace(cmd) == command {
 				changed = true
+				entryChanged = true
 				continue
 			}
 			filtered = append(filtered, h)
 		}
-		if len(filtered) == 0 {
-			changed = true
+		if entryChanged && len(filtered) == 0 {
 			continue
 		}
-		m["hooks"] = filtered
+		if entryChanged {
+			m["hooks"] = filtered
+		}
 		kept = append(kept, m)
 	}
 	return kept, changed

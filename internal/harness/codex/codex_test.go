@@ -499,6 +499,116 @@ func TestCodexHookMutationPreservesUnrelatedJSONAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestCodexHookMutationRejectsMalformedExistingContainers(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		initial string
+		wantErr string
+	}{
+		{
+			name:    "hooks is not object",
+			initial: `{"hooks":"user-owned"}`,
+			wantErr: "hooks must be an object",
+		},
+		{
+			name:    "SessionStart is not array",
+			initial: `{"hooks":{"SessionStart":{"matcher":"startup","hooks":[]}}}`,
+			wantErr: "hooks.SessionStart must be an array",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
+			path := filepath.Join(home, "codex-home", "hooks.json")
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.initial), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			added, err := New().InstallSessionStartHook("flow hook session-start --harness codex")
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("InstallSessionStartHook err=%v, want %q", err, tc.wantErr)
+			}
+			if added {
+				t.Fatal("InstallSessionStartHook added=true, want false on malformed existing config")
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(raw) != tc.initial {
+				t.Fatalf("malformed user config was rewritten:\n got: %s\nwant: %s", raw, tc.initial)
+			}
+		})
+	}
+}
+
+func TestCodexHookMutationPreservesMalformedUnrelatedEntries(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
+	path := filepath.Join(home, "codex-home", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initial := `{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "object-hooks", "hooks": {"command": "user-owned"}},
+      {"matcher": "missing-hooks"},
+      {"matcher": "empty-hooks", "hooks": []},
+      "string-entry",
+      {"matcher": "old", "hooks": [{"type": "command", "command": "flow hook session-start --harness codex", "timeout": 1}]}
+    ]
+  }
+}`
+	if err := os.WriteFile(path, []byte(initial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New()
+	added, err := h.InstallSessionStartHook("flow hook session-start --harness codex")
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if !added {
+		t.Fatal("install added=false, want true")
+	}
+	entries := readCodexSessionStartEntries(t, path)
+	for _, matcher := range []string{"object-hooks", "missing-hooks", "empty-hooks"} {
+		if !codexHookEntriesContainMatcher(entries, matcher) {
+			t.Fatalf("malformed unrelated entry %q not preserved: %#v", matcher, entries)
+		}
+	}
+	if !codexHookEntriesContainString(entries, "string-entry") {
+		t.Fatalf("string entry not preserved: %#v", entries)
+	}
+	if got := countCodexHookCommands(entries, "flow hook session-start --harness codex"); got != 1 {
+		t.Fatalf("matching SessionStart hooks=%d, want 1; entries=%#v", got, entries)
+	}
+
+	removed, err := h.UninstallSessionStartHook("flow hook session-start --harness codex")
+	if err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	if !removed {
+		t.Fatal("uninstall removed=false, want true")
+	}
+	entries = readCodexSessionStartEntries(t, path)
+	for _, matcher := range []string{"object-hooks", "missing-hooks", "empty-hooks"} {
+		if !codexHookEntriesContainMatcher(entries, matcher) {
+			t.Fatalf("malformed unrelated entry %q not preserved after uninstall: %#v", matcher, entries)
+		}
+	}
+	if !codexHookEntriesContainString(entries, "string-entry") {
+		t.Fatalf("string entry not preserved after uninstall: %#v", entries)
+	}
+	if got := countCodexHookCommands(entries, "flow hook session-start --harness codex"); got != 0 {
+		t.Fatalf("matching hooks after uninstall=%d, want 0; entries=%#v", got, entries)
+	}
+}
+
 func TestCodexSessionStartHookWarningDetectsDisabledConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
@@ -533,6 +643,19 @@ func TestCodexTranscriptUnsupportedForNow(t *testing.T) {
 	}
 }
 
+func readCodexSessionStartEntries(t *testing.T, path string) []any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hooks map[string]any
+	if err := json.Unmarshal(raw, &hooks); err != nil {
+		t.Fatalf("parse hooks.json: %v\n%s", err, raw)
+	}
+	return hooks["hooks"].(map[string]any)["SessionStart"].([]any)
+}
+
 func countCodexHookCommands(entries []any, command string) int {
 	n := 0
 	for _, entry := range entries {
@@ -541,6 +664,28 @@ func countCodexHookCommands(entries []any, command string) int {
 		}
 	}
 	return n
+}
+
+func codexHookEntriesContainMatcher(entries []any, matcher string) bool {
+	for _, entry := range entries {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if got, _ := m["matcher"].(string); got == matcher {
+			return true
+		}
+	}
+	return false
+}
+
+func codexHookEntriesContainString(entries []any, want string) bool {
+	for _, entry := range entries {
+		if got, _ := entry.(string); got == want {
+			return true
+		}
+	}
+	return false
 }
 
 func codexHookEventReferencesCommand(events map[string]any, event, command string) bool {
