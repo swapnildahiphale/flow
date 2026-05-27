@@ -464,6 +464,47 @@ func TestCmdDoFreshDetectsTaskChangedDuringPrepare(t *testing.T) {
 	}
 }
 
+func TestCmdDoFreshDetectsWorkDirChangedWithSameUpdatedAtDuringPrepare(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "same-updated-at-workdir")
+	spawns, _ := stubITerm(t)
+
+	db := openFlowDB(t)
+	original, err := flowdb.GetTask(db, "same-updated-at-workdir")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newWorkDir := t.TempDir()
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) {
+		_, err := db.Exec(
+			`UPDATE tasks SET work_dir=?, updated_at=? WHERE slug='same-updated-at-workdir'`,
+			newWorkDir, original.UpdatedAt,
+		)
+		return "22222222-3333-4444-8555-777777777777", err
+	}
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	if rc := cmdDo([]string{"same-updated-at-workdir"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if got := atomic.LoadInt64(spawns); got != 0 {
+		t.Fatalf("spawn count=%d, want 0", got)
+	}
+
+	task, err := flowdb.GetTask(db, "same-updated-at-workdir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.SessionID.Valid {
+		t.Fatalf("session_id=%q, want NULL", task.SessionID.String)
+	}
+	if task.WorkDir != newWorkDir {
+		t.Fatalf("work_dir=%q, want concurrent update %q preserved", task.WorkDir, newWorkDir)
+	}
+}
+
 func TestCmdDoFreshConcurrentBindDuringPrepareRefuses(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "concurrent-bind")

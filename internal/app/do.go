@@ -314,17 +314,25 @@ func cmdDo(args []string) int {
 		if curSessionID.Valid {
 			expectedSessionID = curSessionID.String
 		}
+		expectedPlaybookSlug := ""
+		if task.PlaybookSlug.Valid {
+			expectedPlaybookSlug = task.PlaybookSlug.String
+		}
 		res, err := tx.Exec(
 			`UPDATE tasks SET status='in-progress',
-			 status_changed_at = CASE WHEN status != 'in-progress' THEN ? ELSE status_changed_at END,
-			 session_id=?, session_started=?,
-			 harness=?,
+				 status_changed_at = CASE WHEN status != 'in-progress' THEN ? ELSE status_changed_at END,
+				 session_id=?, session_started=?,
+				 harness=?,
 			 updated_at=?
 			 WHERE slug=?
-			   AND `+statusFilter+`
-			   AND updated_at=?
-			   AND ((? = '' AND session_id IS NULL) OR session_id = ?)`,
+				   AND `+statusFilter+`
+				   AND work_dir=?
+				   AND kind=?
+				   AND ((? = '' AND playbook_slug IS NULL) OR playbook_slug = ?)
+				   AND updated_at=?
+				   AND ((? = '' AND session_id IS NULL) OR session_id = ?)`,
 			now, sessionID, now, string(h.Name()), now, task.Slug,
+			task.WorkDir, task.Kind, expectedPlaybookSlug, expectedPlaybookSlug,
 			task.UpdatedAt, expectedSessionID, expectedSessionID,
 		)
 		if err != nil {
