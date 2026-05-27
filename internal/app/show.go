@@ -55,7 +55,7 @@ func showTaskCmd(args []string) int {
 
 	var t *flowdb.Task
 	if ref == "" {
-		// No explicit ref: reverse-lookup via the current Claude session.
+		// No explicit ref: reverse-lookup via the current harness session.
 		bound, lookupErr := currentSessionTask(db)
 		if lookupErr != nil {
 			if isNoBindingErr(lookupErr) {
@@ -95,7 +95,7 @@ func showTaskCmd(args []string) int {
 
 // showProjectCmd implements `flow show project [<ref>]`. With no
 // argument, falls back to the project of the task bound to the
-// current Claude session.
+// current harness session.
 func showProjectCmd(args []string) int {
 	fs := flagSet("show project")
 	if err := fs.Parse(args); err != nil {

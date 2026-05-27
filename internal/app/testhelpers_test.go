@@ -36,7 +36,7 @@ func insertTask(t *testing.T, db *sql.DB, slug, name, status, priority, wd strin
 	// Session-id invariant: only backlog may have a NULL session_id.
 	// Tests that create non-backlog rows get a deterministic per-slug
 	// placeholder UUID — unique (so the partial unique index is happy)
-	// without needing real Claude session bookkeeping.
+	// without needing real harness session bookkeeping.
 	var sessionID any
 	if status != "backlog" {
 		sessionID = fakeSessionID(slug)
@@ -53,7 +53,7 @@ func insertTask(t *testing.T, db *sql.DB, slug, name, status, priority, wd strin
 
 // fakeSessionID makes a deterministic v4-shaped UUID derived from
 // slug. Used by insertTask to satisfy the session-id invariant on
-// non-backlog rows without entangling tests with real Claude
+// non-backlog rows without entangling tests with real harness
 // session lifecycles. The format passes sessionUUIDRe so tests that
 // pin --session-id-style behavior keep working.
 func fakeSessionID(slug string) string {

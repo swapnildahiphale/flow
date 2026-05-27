@@ -32,7 +32,7 @@ func currentSessionID() (string, error) {
 	return ambient.Value, nil
 }
 
-// currentSessionTask returns the task bound to this Claude session
+// currentSessionTask returns the task bound to this harness session
 // via tasks.session_id. Returns sql.ErrNoRows if the current session
 // is unbound (dispatch session) or the env var is missing. This is
 // the canonical "what task am I on?" lookup — replaces the legacy
@@ -47,7 +47,7 @@ func currentSessionTask(db *sql.DB) (*flowdb.Task, error) {
 
 // isNoBindingErr is a small predicate for the dispatch-session case.
 // Callers use it to differentiate "no current binding" from real
-// scan errors when reverse-looking-up by $CLAUDE_CODE_SESSION_ID.
+// scan errors when reverse-looking-up by the harness session env var.
 func isNoBindingErr(err error) bool {
 	return errors.Is(err, sql.ErrNoRows)
 }
