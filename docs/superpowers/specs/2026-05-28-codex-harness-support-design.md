@@ -166,7 +166,7 @@ Codex implementation:
 
 - `PrepareFreshSession` runs a minimal Codex allocation prompt with
   `codex exec --json`.
-- Parse the first `thread.started.thread_id`.
+- Parse the first `thread.started` event's top-level `thread_id`.
 - Continue reading the JSON stream until the allocation `codex exec` process
   exits.
 - Return `PreparedSession` only if the process exits successfully. If the

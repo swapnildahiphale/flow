@@ -60,7 +60,7 @@ sequenceDiagram
   U->>F: flow do --harness codex task
   F->>H: Resolve codex harness
   F->>C: codex exec --json --skip-git-repo-check allocation prompt
-  C-->>F: thread.started.thread_id
+  C-->>F: thread.started { thread_id }
   F->>DB: Bind task to harness=codex and session_id
   F->>C: codex exec resume --skip-git-repo-check id bootstrap prompt
   C-->>F: bootstrap finished
@@ -862,10 +862,8 @@ func parseThreadStarted(out []byte) (string, error) {
 	dec := json.NewDecoder(bytes.NewReader(out))
 	for {
 		var evt struct {
-			Type   string `json:"type"`
-			Thread struct {
-				ID string `json:"thread_id"`
-			} `json:"thread"`
+			Type     string `json:"type"`
+			ThreadID string `json:"thread_id"`
 		}
 		err := dec.Decode(&evt)
 		if errors.Is(err, io.EOF) {
@@ -874,11 +872,11 @@ func parseThreadStarted(out []byte) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("decode codex json event: %w", err)
 		}
-		if evt.Type == "thread.started" && evt.Thread.ID != "" {
-			return evt.Thread.ID, nil
+		if evt.Type == "thread.started" && evt.ThreadID != "" {
+			return evt.ThreadID, nil
 		}
 	}
-	return "", fmt.Errorf("codex allocation did not emit thread.started.thread_id")
+	return "", fmt.Errorf("codex allocation did not emit thread.started thread_id")
 }
 ```
 
@@ -1089,7 +1087,7 @@ func TestPrepareFreshSessionParsesThreadStarted(t *testing.T) {
 	CommandRunner = func(ctx harness.SessionContext, args []string) ([]byte, error) {
 		gotCtx = ctx
 		gotArgs = append([]string(nil), args...)
-		return []byte(`{"type":"thread.started","thread":{"thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}}` + "\n" +
+		return []byte(`{"type":"thread.started","thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}` + "\n" +
 			`{"type":"turn.completed"}` + "\n"), nil
 	}
 
@@ -1137,7 +1135,7 @@ func stubCodexPrepareSuccess(t *testing.T, id string) *[]string {
 	codex.CommandRunner = func(ctx harness.SessionContext, args []string) ([]byte, error) {
 		calls = append(calls, strings.Join(args, "\x00"))
 		if len(args) >= 2 && args[0] == "exec" && args[1] == "--json" {
-			return []byte(`{"type":"thread.started","thread":{"thread_id":"` + id + `"}}` + "\n"), nil
+			return []byte(`{"type":"thread.started","thread_id":"` + id + `"}` + "\n"), nil
 		}
 		return []byte(`{"type":"turn.completed"}` + "\n"), nil
 	}

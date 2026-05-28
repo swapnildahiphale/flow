@@ -123,8 +123,9 @@ func (c *codex) SkipPermissionsRun(ctx harness.SessionContext, prompt string) er
 }
 
 type codexEvent struct {
-	Type   string `json:"type"`
-	Thread struct {
+	Type     string `json:"type"`
+	ThreadID string `json:"thread_id"`
+	Thread   struct {
 		ThreadID string `json:"thread_id"`
 	} `json:"thread"`
 }
@@ -143,11 +144,15 @@ func parseThreadStarted(out []byte) (string, error) {
 		if ev.Type != "thread.started" {
 			continue
 		}
-		if ev.Thread.ThreadID == "" {
-			return "", fmt.Errorf("codex thread.started missing thread.thread_id")
+		id := ev.ThreadID
+		if id == "" {
+			id = ev.Thread.ThreadID
+		}
+		if id == "" {
+			return "", fmt.Errorf("codex thread.started missing thread_id")
 		}
 		if threadID == "" {
-			threadID = ev.Thread.ThreadID
+			threadID = id
 		}
 	}
 	if threadID == "" {

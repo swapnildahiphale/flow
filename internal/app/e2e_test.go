@@ -265,7 +265,7 @@ func TestE2ECodexHarnessRoundtrip(t *testing.T) {
 	calls := stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
 		switch call {
 		case 1:
-			return []byte(`{"type":"thread.started","thread":{"thread_id":"` + sid + `"}}` + "\n"), nil
+			return []byte(`{"type":"thread.started","thread_id":"` + sid + `"}` + "\n"), nil
 		case 2:
 			return nil, nil
 		case 3:

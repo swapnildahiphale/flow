@@ -382,7 +382,7 @@ func TestCmdDoHarnessCodexFreshAllocatesBootstrapsAndSpawns(t *testing.T) {
 	calls := stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
 		switch call {
 		case 1:
-			return []byte(`{"type":"thread.started","thread":{"thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}}` + "\n"), nil
+			return []byte(`{"type":"thread.started","thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}` + "\n"), nil
 		case 2:
 			return nil, nil
 		default:
@@ -453,7 +453,7 @@ func TestCmdDoFreshHarnessCodexReplacesPinnedClaudeTask(t *testing.T) {
 	stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
 		switch call {
 		case 1:
-			return []byte(`{"type":"thread.started","thread":{"thread_id":"` + newSID + `"}}` + "\n"), nil
+			return []byte(`{"type":"thread.started","thread_id":"` + newSID + `"}` + "\n"), nil
 		case 2:
 			return nil, nil
 		default:
@@ -524,7 +524,7 @@ func TestCmdDoHarnessCodexBootstrapFailureRollsBackFreshBind(t *testing.T) {
 			stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
 				switch call {
 				case 1:
-					return []byte(`{"type":"thread.started","thread":{"thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}}` + "\n"), nil
+					return []byte(`{"type":"thread.started","thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}` + "\n"), nil
 				case 2:
 					return nil, errors.New("bootstrap blew up")
 				default:

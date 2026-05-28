@@ -65,7 +65,7 @@ func TestPrepareFreshSessionParsesThreadStarted(t *testing.T) {
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
 		gotCtx = ctx
 		gotArgs = append([]string(nil), args...)
-		return []byte(`{"type":"noise"}` + "\n" + `{"type":"thread.started","thread":{"thread_id":"` + testThreadID + `"}}` + "\n"), nil
+		return []byte(`{"type":"noise"}` + "\n" + `{"type":"thread.started","thread_id":"` + testThreadID + `"}` + "\n"), nil
 	})
 
 	ctx := harness.SessionContext{WorkDir: "/tmp/work", Env: []string{"FLOW_ROOT=/tmp/flow-root"}}
@@ -98,7 +98,7 @@ func TestPrepareFreshSessionDangerousFlagAndRunnerErrorWins(t *testing.T) {
 	var gotArgs []string
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
 		gotArgs = append([]string(nil), args...)
-		return []byte(`{"type":"thread.started","thread":{"thread_id":"` + testThreadID + `"}}` + "\n"), errors.New("codex failed")
+		return []byte(`{"type":"thread.started","thread_id":"` + testThreadID + `"}` + "\n"), errors.New("codex failed")
 	})
 
 	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{SkipPermissions: true})
@@ -139,7 +139,7 @@ func TestPrepareFreshSessionMalformedJSON(t *testing.T) {
 
 func TestPrepareFreshSessionMalformedJSONAfterThreadStarted(t *testing.T) {
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
-		return []byte(`{"type":"thread.started","thread":{"thread_id":"` + testThreadID + `"}}` + "\n" +
+		return []byte(`{"type":"thread.started","thread_id":"` + testThreadID + `"}` + "\n" +
 			`{"type":"broken"`), nil
 	})
 	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{})
@@ -150,11 +150,25 @@ func TestPrepareFreshSessionMalformedJSONAfterThreadStarted(t *testing.T) {
 
 func TestPrepareFreshSessionRejectsInvalidThreadID(t *testing.T) {
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
-		return []byte(`{"type":"thread.started","thread":{"thread_id":"not-a-uuid"}}` + "\n"), nil
+		return []byte(`{"type":"thread.started","thread_id":"not-a-uuid"}` + "\n"), nil
 	})
 	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{})
 	if err == nil || !strings.Contains(err.Error(), "not a valid codex thread UUID") {
 		t.Fatalf("err=%v, want invalid thread id error", err)
+	}
+}
+
+func TestPrepareFreshSessionParsesNestedThreadStartedForCompatibility(t *testing.T) {
+	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		return []byte(`{"type":"thread.started","thread":{"thread_id":"` + testThreadID + `"}}` + "\n"), nil
+	})
+
+	got, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{})
+	if err != nil {
+		t.Fatalf("PrepareFreshSession: %v", err)
+	}
+	if got.SessionID != testThreadID {
+		t.Fatalf("SessionID=%q, want %q", got.SessionID, testThreadID)
 	}
 }
 
