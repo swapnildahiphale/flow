@@ -319,7 +319,7 @@ Terminal.app (auto-detected from `$TERM_PROGRAM`) — chosen in that
 priority order, with iTerm as the historical fallback.
 
 For the default Claude harness, flow pre-allocates a UUID and runs
-`claude --session-id <uuid>` with `FLOW_TASK` / `FLOW_PROJECT` inlined.
+`claude --session-id <uuid>` with the real bootstrap prompt inlined.
 The jsonl file lands at
 `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, so future `flow do`
 calls run `claude --resume <uuid>` to continue the same conversation.
