@@ -258,7 +258,7 @@ func TestCmdRunPlaybookHarnessCodexAllocatesAndPinsRunTask(t *testing.T) {
 	_, getScript := stubITerm(t)
 
 	const sid = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
-	stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+	stubCodexFreshCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
 		switch call {
 		case 1:
 			return []byte(`{"type":"thread.started","thread_id":"` + sid + `"}` + "\n"), nil

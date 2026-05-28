@@ -1900,10 +1900,13 @@ session id in `tasks.session_id` before the interactive session is
 handed to the user. For Claude, flow pre-allocates a UUID and passes it
 to `claude --session-id <uuid>`, which writes the jsonl transcript at
 `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`. For Codex, flow first
+checks that `codex resume --help` advertises `[PROMPT]` support, then
 asks `codex exec --json` to allocate a thread, stores the emitted
 thread id, and opens `codex resume <id> <bootstrap-prompt>`
 interactively in the spawned terminal tab. Codex transcripts live under
-`$CODEX_HOME/sessions` or `~/.codex/sessions`.
+`$CODEX_HOME/sessions` or `~/.codex/sessions`. If the installed Codex
+CLI lacks interactive resume prompt support, fresh Codex launch fails
+before any task is bound to a thread.
 
 There is no self-registration step — the DB is authoritative from the
 moment the session is bound. Subsequent `flow do <same-task>` calls read

@@ -59,6 +59,8 @@ sequenceDiagram
 
   U->>F: flow do --harness codex task
   F->>H: Resolve codex harness
+  F->>C: codex resume --help
+  C-->>F: usage includes [PROMPT]
   F->>C: codex exec --json --skip-git-repo-check allocation prompt
   C-->>F: thread.started { thread_id }
   F->>DB: Bind task to harness=codex and session_id
@@ -911,6 +913,9 @@ Implement fresh lifecycle:
 
 ```go
 func (c *codex) PrepareFreshSession(ctx harness.SessionContext, prompt string, opts harness.LaunchOpts) (harness.PreparedSession, error) {
+	if err := c.ensureResumePromptSupport(ctx); err != nil {
+		return harness.PreparedSession{}, err
+	}
 	out, err := CommandRunner(ctx, execArgs(true, allocationPrompt, opts))
 	if err != nil {
 		return harness.PreparedSession{}, fmt.Errorf("codex allocate thread: %w", err)
@@ -1073,11 +1078,14 @@ func TestPrepareFreshSessionParsesThreadStarted(t *testing.T) {
 	orig := CommandRunner
 	t.Cleanup(func() { CommandRunner = orig })
 
-	var gotArgs []string
+	var gotArgs [][]string
 	var gotCtx harness.SessionContext
 	CommandRunner = func(ctx harness.SessionContext, args []string) ([]byte, error) {
 		gotCtx = ctx
-		gotArgs = append([]string(nil), args...)
+		gotArgs = append(gotArgs, append([]string(nil), args...))
+		if slices.Equal(args, []string{"resume", "--help"}) {
+			return []byte("Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]\n"), nil
+		}
 		return []byte(`{"type":"thread.started","thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}` + "\n" +
 			`{"type":"turn.completed"}` + "\n"), nil
 	}
@@ -1089,10 +1097,13 @@ func TestPrepareFreshSessionParsesThreadStarted(t *testing.T) {
 	if got.SessionID != "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40" {
 		t.Fatalf("SessionID=%q", got.SessionID)
 	}
-	if got.LaunchCommand != "codex resume 018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40" {
+	if got.LaunchCommand != "codex resume 018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40 'real bootstrap'" {
 		t.Fatalf("LaunchCommand=%q", got.LaunchCommand)
 	}
-	if strings.Join(gotArgs, " ") != "exec --json --skip-git-repo-check "+allocationPrompt {
+	if len(gotArgs) != 2 || !slices.Equal(gotArgs[0], []string{"resume", "--help"}) {
+		t.Fatalf("calls=%q, want resume help then allocation", gotArgs)
+	}
+	if strings.Join(gotArgs[1], " ") != "exec --json --skip-git-repo-check "+allocationPrompt {
 		t.Fatalf("args=%q", gotArgs)
 	}
 	if gotCtx.WorkDir != "/tmp/work" {
@@ -1105,6 +1116,8 @@ Add these focused tests in the same file:
 
 ```go
 func TestPrepareFreshSessionReturnsRunnerError(t *testing.T)
+func TestPrepareFreshSessionRequiresResumePromptSupport(t *testing.T)
+func TestPrepareFreshSessionWrapsResumePromptSupportCheckError(t *testing.T)
 func TestPrepareFreshSessionRequiresThreadStarted(t *testing.T)
 func TestBootstrapFreshSessionIsNoop(t *testing.T)
 func TestResumeCmdWithInjectionExecsThenResumes(t *testing.T)
@@ -1119,19 +1132,20 @@ func TestLiveSessionIDsParsesCodexResumeProcesses(t *testing.T)
 In `internal/app/do_test.go`, add a helper that stubs `codex.CommandRunner`:
 
 ```go
-func stubCodexPrepareSuccess(t *testing.T, id string) *[]string {
+func stubCodexFreshCommandRunner(t *testing.T, fn func(call int, ctx harness.SessionContext, args []string) ([]byte, error)) *[]capturedCodexCommand {
 	t.Helper()
 	orig := codex.CommandRunner
-	var calls []string
+	calls := &[]capturedCodexCommand{}
 	codex.CommandRunner = func(ctx harness.SessionContext, args []string) ([]byte, error) {
-		calls = append(calls, strings.Join(args, "\x00"))
-		if len(args) >= 2 && args[0] == "exec" && args[1] == "--json" {
-			return []byte(`{"type":"thread.started","thread_id":"` + id + `"}` + "\n"), nil
+		cp := append([]string(nil), args...)
+		if slices.Equal(cp, []string{"resume", "--help"}) {
+			return []byte("Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]\n"), nil
 		}
-		return []byte(`{"type":"turn.completed"}` + "\n"), nil
+		*calls = append(*calls, capturedCodexCommand{ctx: ctx, args: cp})
+		return fn(len(*calls), ctx, cp)
 	}
 	t.Cleanup(func() { codex.CommandRunner = orig })
-	return &calls
+	return calls
 }
 ```
 
@@ -1142,7 +1156,9 @@ func TestCmdDoHarnessCodexFreshBindsBootstrapsAndSpawnsResume(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "codex-task")
 	_, spawned := stubITerm(t)
-	calls := stubCodexPrepareSuccess(t, "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40")
+	calls := stubCodexFreshCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+		return []byte(`{"type":"thread.started","thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}` + "\n"), nil
+	})
 
 	if rc := cmdDo([]string{"codex-task", "--harness", "codex"}); rc != 0 {
 		t.Fatalf("cmdDo rc=%d", rc)
@@ -1155,16 +1171,19 @@ func TestCmdDoHarnessCodexFreshBindsBootstrapsAndSpawnsResume(t *testing.T) {
 	if task.Harness.String != "codex" || task.SessionID.String != "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40" {
 		t.Fatalf("task harness/session=%q/%q", task.Harness.String, task.SessionID.String)
 	}
-	if spawned.LastCommand != "codex resume 018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40" {
+	if !strings.Contains(spawned.LastCommand, "codex resume 018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40") ||
+		!strings.Contains(spawned.LastCommand, "execution session for flow task codex-task") {
 		t.Fatalf("spawned command=%q", spawned.LastCommand)
 	}
-	if len(*calls) != 2 {
+	if len(*calls) != 1 {
 		t.Fatalf("codex calls=%v", *calls)
 	}
 }
 ```
 
-Add a rollback test where the second `CommandRunner` call returns an error, then assert the task returns to backlog with NULL `session_id`.
+Add a test for missing resume-prompt support that asserts no allocation happens
+and the task remains unbound. Add a spawn-failure rollback test that asserts the
+task returns to backlog with NULL `session_id`.
 
 - [ ] **Step 11: Run focused tests**
 
@@ -1201,6 +1220,11 @@ git commit -m "feat: add codex harness adapter"
 - [ ] **Step 1: Finalize fresh and resume behavior in `cmdDo`**
 
 Keep the Task 1 lifecycle order exactly: build `prompt`, `launchOpts`, and `sessionCtx`; run `PrepareFreshSession` outside the write transaction when the outside snapshot needs a fresh session; open the transaction and re-read the row; bind with a compare-and-swap update; commit; run `BootstrapFreshSession`; then spawn. For Codex, `BootstrapFreshSession` is intentionally a no-op because the launch command passes the real bootstrap prompt to interactive `codex resume`.
+
+Codex `PrepareFreshSession` must first check `codex resume --help` and refuse
+fresh allocation unless the installed CLI advertises `[PROMPT]` for interactive
+resume. This fails before DB binding, so unsupported Codex CLI versions do not
+leave a task pinned to a thread that cannot receive Flow's bootstrap prompt.
 
 With Codex registered, the post-commit branch should be:
 

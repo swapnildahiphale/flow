@@ -13,6 +13,11 @@ import (
 )
 
 const testThreadID = "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"
+const resumeHelpWithPrompt = "Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]\n\nArguments:\n  [PROMPT]\n          Optional user prompt to start the session\n"
+
+func isResumeHelpArgs(args []string) bool {
+	return slices.Equal(args, []string{"resume", "--help"})
+}
 
 func stubCommandRunner(t *testing.T, fn Runner) {
 	t.Helper()
@@ -61,10 +66,13 @@ func TestValidateSessionAlwaysSucceeds(t *testing.T) {
 
 func TestPrepareFreshSessionParsesThreadStarted(t *testing.T) {
 	var gotCtx harness.SessionContext
-	var gotArgs []string
+	var gotArgs [][]string
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
 		gotCtx = ctx
-		gotArgs = append([]string(nil), args...)
+		gotArgs = append(gotArgs, append([]string(nil), args...))
+		if isResumeHelpArgs(args) {
+			return []byte(resumeHelpWithPrompt), nil
+		}
 		return []byte(`{"type":"noise"}` + "\n" + `{"type":"thread.started","thread_id":"` + testThreadID + `"}` + "\n"), nil
 	})
 
@@ -80,7 +88,13 @@ func TestPrepareFreshSessionParsesThreadStarted(t *testing.T) {
 		"--skip-git-repo-check",
 		allocationPrompt,
 	}
-	if !slices.Equal(gotArgs, wantArgs) {
+	if len(gotArgs) != 2 {
+		t.Fatalf("codex calls=%q, want help + allocation", gotArgs)
+	}
+	if !isResumeHelpArgs(gotArgs[0]) {
+		t.Fatalf("first args=%q, want resume help", gotArgs[0])
+	}
+	if !slices.Equal(gotArgs[1], wantArgs) {
 		t.Fatalf("args=%q, want %q", gotArgs, wantArgs)
 	}
 	if gotCtx.WorkDir != ctx.WorkDir || !slices.Equal(gotCtx.Env, ctx.Env) {
@@ -97,6 +111,9 @@ func TestPrepareFreshSessionParsesThreadStarted(t *testing.T) {
 
 func TestPrepareFreshSessionLaunchCommandIncludesInjectionAndDangerousResume(t *testing.T) {
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		if isResumeHelpArgs(args) {
+			return []byte(resumeHelpWithPrompt), nil
+		}
 		return []byte(`{"type":"thread.started","thread_id":"` + testThreadID + `"}` + "\n"), nil
 	})
 
@@ -118,6 +135,9 @@ func TestPrepareFreshSessionLaunchCommandIncludesInjectionAndDangerousResume(t *
 func TestPrepareFreshSessionDangerousFlagAndRunnerErrorWins(t *testing.T) {
 	var gotArgs []string
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		if isResumeHelpArgs(args) {
+			return []byte(resumeHelpWithPrompt), nil
+		}
 		gotArgs = append([]string(nil), args...)
 		return []byte(`{"type":"thread.started","thread_id":"` + testThreadID + `"}` + "\n"), errors.New("codex failed")
 	})
@@ -138,8 +158,41 @@ func TestPrepareFreshSessionDangerousFlagAndRunnerErrorWins(t *testing.T) {
 	}
 }
 
+func TestPrepareFreshSessionRequiresResumePromptSupport(t *testing.T) {
+	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		if isResumeHelpArgs(args) {
+			return []byte("Usage: codex resume [OPTIONS] [SESSION_ID]\n"), nil
+		}
+		t.Fatalf("allocation should not run when resume prompt support is absent: %q", args)
+		return nil, nil
+	})
+
+	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{})
+	if err == nil || !strings.Contains(err.Error(), "codex resume prompt support") {
+		t.Fatalf("err=%v, want resume prompt support error", err)
+	}
+}
+
+func TestPrepareFreshSessionWrapsResumePromptSupportCheckError(t *testing.T) {
+	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		if isResumeHelpArgs(args) {
+			return nil, errors.New("help failed")
+		}
+		t.Fatalf("allocation should not run when resume help fails: %q", args)
+		return nil, nil
+	})
+
+	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{})
+	if err == nil || !strings.Contains(err.Error(), "check codex resume prompt support") || !strings.Contains(err.Error(), "help failed") {
+		t.Fatalf("err=%v, want wrapped help error", err)
+	}
+}
+
 func TestPrepareFreshSessionMissingThreadStarted(t *testing.T) {
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		if isResumeHelpArgs(args) {
+			return []byte(resumeHelpWithPrompt), nil
+		}
 		return []byte(`{"type":"message","text":"hello"}` + "\n"), nil
 	})
 	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{})
@@ -150,6 +203,9 @@ func TestPrepareFreshSessionMissingThreadStarted(t *testing.T) {
 
 func TestPrepareFreshSessionMalformedJSON(t *testing.T) {
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		if isResumeHelpArgs(args) {
+			return []byte(resumeHelpWithPrompt), nil
+		}
 		return []byte(`{"type":"thread.started"`), nil
 	})
 	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{})
@@ -160,6 +216,9 @@ func TestPrepareFreshSessionMalformedJSON(t *testing.T) {
 
 func TestPrepareFreshSessionMalformedJSONAfterThreadStarted(t *testing.T) {
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		if isResumeHelpArgs(args) {
+			return []byte(resumeHelpWithPrompt), nil
+		}
 		return []byte(`{"type":"thread.started","thread_id":"` + testThreadID + `"}` + "\n" +
 			`{"type":"broken"`), nil
 	})
@@ -171,6 +230,9 @@ func TestPrepareFreshSessionMalformedJSONAfterThreadStarted(t *testing.T) {
 
 func TestPrepareFreshSessionRejectsInvalidThreadID(t *testing.T) {
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		if isResumeHelpArgs(args) {
+			return []byte(resumeHelpWithPrompt), nil
+		}
 		return []byte(`{"type":"thread.started","thread_id":"not-a-uuid"}` + "\n"), nil
 	})
 	_, err := New().PrepareFreshSession(harness.SessionContext{}, "prompt", harness.LaunchOpts{})
@@ -181,6 +243,9 @@ func TestPrepareFreshSessionRejectsInvalidThreadID(t *testing.T) {
 
 func TestPrepareFreshSessionParsesNestedThreadStartedForCompatibility(t *testing.T) {
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		if isResumeHelpArgs(args) {
+			return []byte(resumeHelpWithPrompt), nil
+		}
 		return []byte(`{"type":"thread.started","thread":{"thread_id":"` + testThreadID + `"}}` + "\n"), nil
 	})
 

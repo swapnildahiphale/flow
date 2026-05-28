@@ -46,13 +46,26 @@ type capturedCodexCommand struct {
 	args []string
 }
 
+const codexResumeHelpWithPrompt = "Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]\n\nArguments:\n  [PROMPT]\n          Optional user prompt to start the session\n"
+
 func stubCodexCommandRunner(t *testing.T, fn func(call int, ctx harness.SessionContext, args []string) ([]byte, error)) *[]capturedCodexCommand {
+	return stubCodexCommandRunnerWithOptions(t, false, fn)
+}
+
+func stubCodexFreshCommandRunner(t *testing.T, fn func(call int, ctx harness.SessionContext, args []string) ([]byte, error)) *[]capturedCodexCommand {
+	return stubCodexCommandRunnerWithOptions(t, true, fn)
+}
+
+func stubCodexCommandRunnerWithOptions(t *testing.T, allowResumeHelp bool, fn func(call int, ctx harness.SessionContext, args []string) ([]byte, error)) *[]capturedCodexCommand {
 	t.Helper()
 	oldRunner := codex.CommandRunner
 	oldPS := codex.PSRunner
 	calls := &[]capturedCodexCommand{}
 	codex.CommandRunner = func(ctx harness.SessionContext, args []string) ([]byte, error) {
 		cp := append([]string(nil), args...)
+		if allowResumeHelp && slices.Equal(cp, []string{"resume", "--help"}) {
+			return []byte(codexResumeHelpWithPrompt), nil
+		}
 		*calls = append(*calls, capturedCodexCommand{ctx: ctx, args: cp})
 		return fn(len(*calls), ctx, cp)
 	}
@@ -379,7 +392,7 @@ func TestCmdDoHarnessCodexFreshAllocatesBootstrapsAndSpawns(t *testing.T) {
 	seedTask(t, "codex-fresh")
 	_, getScript := stubITerm(t)
 
-	calls := stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+	calls := stubCodexFreshCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
 		switch call {
 		case 1:
 			return []byte(`{"type":"thread.started","thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}` + "\n"), nil
@@ -432,6 +445,42 @@ func TestCmdDoHarnessCodexFreshAllocatesBootstrapsAndSpawns(t *testing.T) {
 	}
 }
 
+func TestCmdDoHarnessCodexResumePromptSupportFailureDoesNotBind(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "codex-no-prompt")
+	stubITerm(t)
+
+	calls := stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+		if call != 1 || !slices.Equal(args, []string{"resume", "--help"}) {
+			t.Fatalf("unexpected codex call %d: %q", call, args)
+		}
+		return []byte("Usage: codex resume [OPTIONS] [SESSION_ID]\n"), nil
+	})
+
+	stderr := captureStderr(t)
+	if rc := cmdDo([]string{"codex-no-prompt", "--harness", "codex"}); rc != 1 {
+		t.Fatalf("cmdDo rc=%d, want 1", rc)
+	}
+	if !strings.Contains(stderr(), "codex resume prompt support") {
+		t.Fatalf("stderr missing prompt support error: %s", stderr())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("codex calls=%d, want only resume help (%#v)", len(*calls), *calls)
+	}
+
+	db := openFlowDB(t)
+	task, err := flowdb.GetTask(db, "codex-no-prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Harness.Valid || task.SessionID.Valid {
+		t.Fatalf("task should remain unbound, got harness=%+v session=%+v", task.Harness, task.SessionID)
+	}
+	if task.Status != "backlog" {
+		t.Fatalf("status=%q, want backlog", task.Status)
+	}
+}
+
 func TestCmdDoFreshHarnessCodexReplacesPinnedClaudeTask(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "codex-repin")
@@ -447,7 +496,7 @@ func TestCmdDoFreshHarnessCodexReplacesPinnedClaudeTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+	stubCodexFreshCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
 		switch call {
 		case 1:
 			return []byte(`{"type":"thread.started","thread_id":"` + newSID + `"}` + "\n"), nil
@@ -528,7 +577,7 @@ func TestCmdDoHarnessCodexSpawnFailureRollsBackFreshBind(t *testing.T) {
 				}
 			}
 
-			stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+			stubCodexFreshCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
 				switch call {
 				case 1:
 					return []byte(`{"type":"thread.started","thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}` + "\n"), nil

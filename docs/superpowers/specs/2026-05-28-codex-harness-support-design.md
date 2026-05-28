@@ -164,6 +164,8 @@ Claude implementation:
 
 Codex implementation:
 
+- Before allocating a fresh thread, run `codex resume --help` and require the
+  usage text to advertise `[PROMPT]` support for interactive resume.
 - `PrepareFreshSession` runs a minimal Codex allocation prompt with
   `codex exec --json`.
 - Parse the first `thread.started` event's top-level `thread_id`.
@@ -205,6 +207,8 @@ Current Codex behavior from the OpenAI Codex source and docs:
 - Codex thread/session ids are UUIDs generated as UUIDv7.
 - `codex exec --json` emits `thread.started` with `thread_id`.
 - Interactive `codex resume <id> <prompt>` accepts a prompt.
+- Flow verifies that installed CLI behavior with `codex resume --help` before
+  fresh allocation and errors before DB binding if `[PROMPT]` is absent.
 - `codex exec resume <id> <prompt>` also accepts a prompt for existing-session
   `--with` injection and close-out sweeps.
 - Codex rollouts live under `$CODEX_HOME/sessions/YYYY/MM/DD/`.
@@ -221,6 +225,8 @@ sequenceDiagram
   participant DB as flow.db
   participant T as terminal tab
 
+  F->>C: codex resume --help
+  C-->>F: usage includes [PROMPT]
   F->>C: codex exec --json --skip-git-repo-check <minimal allocation prompt>
   C-->>F: thread.started { thread_id }
   F->>DB: write harness=codex, session_id=thread_id, status=in-progress and commit
@@ -540,8 +546,11 @@ the user explicitly asks for backup functionality later.
 
 - Codex CLI behavior changes: keep Codex command construction behind the
   adapter and pin tests to fixture output.
-- Bootstrap failure after thread allocation: bind only after `thread.started`,
-  then roll back safely if the real bootstrap resume fails.
+- Unsupported interactive resume prompts: check `codex resume --help` before
+  allocation and fail before DB binding if `[PROMPT]` is absent.
+- Terminal spawn failure after thread allocation: bind only after
+  `thread.started`, then roll back safely if the interactive resume tab cannot
+  be launched.
 - Hook feature naming changes: detect both current and legacy names and warn
   rather than editing config automatically.
 - Transcript schema changes: decode tolerant JSON objects and test with minimal

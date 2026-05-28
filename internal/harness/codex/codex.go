@@ -57,6 +57,9 @@ func (c *codex) ValidateSession(workDir, sessionID string) error {
 }
 
 func (c *codex) PrepareFreshSession(ctx harness.SessionContext, prompt string, opts harness.LaunchOpts) (harness.PreparedSession, error) {
+	if err := c.ensureResumePromptSupport(ctx); err != nil {
+		return harness.PreparedSession{}, err
+	}
 	args := []string{"exec", "--json", "--skip-git-repo-check"}
 	if opts.SkipPermissions {
 		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
@@ -79,6 +82,18 @@ func (c *codex) PrepareFreshSession(ctx harness.SessionContext, prompt string, o
 		SessionID:     threadID,
 		LaunchCommand: c.launchFreshCmd(threadID, prompt, opts),
 	}, nil
+}
+
+func (c *codex) ensureResumePromptSupport(ctx harness.SessionContext) error {
+	out, err := CommandRunner(ctx, []string{"resume", "--help"})
+	if err != nil {
+		return fmt.Errorf("check codex resume prompt support: %w", err)
+	}
+	help := string(out)
+	if !strings.Contains(help, "[PROMPT]") {
+		return fmt.Errorf("codex resume prompt support not detected; upgrade Codex CLI to a version whose `codex resume --help` shows [SESSION_ID] [PROMPT]")
+	}
+	return nil
 }
 
 func (c *codex) BootstrapFreshSession(ctx harness.SessionContext, sessionID, prompt string, opts harness.LaunchOpts) error {

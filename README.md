@@ -331,6 +331,9 @@ stores it in the task row, and opens `codex resume <id> <bootstrap-prompt>`
 interactively in the spawned terminal tab. Codex exposes the current
 thread as `$CODEX_THREAD_ID`; transcripts render from Codex rollout logs
 under `$CODEX_HOME/sessions` or `~/.codex/sessions`.
+Before allocating a thread, flow checks `codex resume --help` and refuses
+fresh Codex launch if the installed Codex CLI does not advertise `[PROMPT]`
+support for interactive resume.
 
 When `flow do <task>` is run for a task whose session is already
 live in another tab, flow focuses that tab instead of spawning a
