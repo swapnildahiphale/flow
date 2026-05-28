@@ -383,8 +383,6 @@ func TestCmdDoHarnessCodexFreshAllocatesBootstrapsAndSpawns(t *testing.T) {
 		switch call {
 		case 1:
 			return []byte(`{"type":"thread.started","thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}` + "\n"), nil
-		case 2:
-			return nil, nil
 		default:
 			t.Fatalf("unexpected codex call %d: %q", call, args)
 			return nil, nil
@@ -395,8 +393,8 @@ func TestCmdDoHarnessCodexFreshAllocatesBootstrapsAndSpawns(t *testing.T) {
 		t.Fatalf("cmdDo rc=%d", rc)
 	}
 
-	if len(*calls) != 2 {
-		t.Fatalf("codex calls=%d, want 2 (%#v)", len(*calls), *calls)
+	if len(*calls) != 1 {
+		t.Fatalf("codex calls=%d, want 1 allocation call (%#v)", len(*calls), *calls)
 	}
 	if !slices.Equal((*calls)[0].args[:3], []string{"exec", "--json", "--skip-git-repo-check"}) {
 		t.Fatalf("allocation args=%q", (*calls)[0].args)
@@ -404,14 +402,7 @@ func TestCmdDoHarnessCodexFreshAllocatesBootstrapsAndSpawns(t *testing.T) {
 	if !strings.Contains((*calls)[0].args[3], "Initialize a new flow-managed Codex thread") {
 		t.Fatalf("allocation prompt=%q", (*calls)[0].args[3])
 	}
-	wantBootstrapPrefix := []string{"exec", "resume", "--skip-git-repo-check", "018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}
-	if !slices.Equal((*calls)[1].args[:4], wantBootstrapPrefix) {
-		t.Fatalf("bootstrap args=%q, want prefix %q", (*calls)[1].args, wantBootstrapPrefix)
-	}
-	if !strings.Contains((*calls)[1].args[4], "execution session for flow task codex-fresh") {
-		t.Fatalf("bootstrap prompt missing task slug: %q", (*calls)[1].args[4])
-	}
-	if !hasEnvValue((*calls)[0].ctx.Env, "FLOW_ROOT="+root) || !hasEnvValue((*calls)[1].ctx.Env, "FLOW_ROOT="+root) {
+	if !hasEnvValue((*calls)[0].ctx.Env, "FLOW_ROOT="+root) {
 		t.Fatalf("FLOW_ROOT was not propagated into codex ctx: %#v", *calls)
 	}
 
@@ -429,6 +420,12 @@ func TestCmdDoHarnessCodexFreshAllocatesBootstrapsAndSpawns(t *testing.T) {
 	script := getScript()
 	if !strings.Contains(script, "codex resume 018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40") {
 		t.Fatalf("spawn script missing codex resume: %s", script)
+	}
+	if strings.Contains(script, "codex exec resume") {
+		t.Fatalf("fresh spawn should not run bootstrap through headless codex exec: %s", script)
+	}
+	if !strings.Contains(script, "execution session for flow task codex-fresh") {
+		t.Fatalf("spawn script missing interactive bootstrap prompt: %s", script)
 	}
 	if !strings.Contains(script, "FLOW_ROOT=") || !strings.Contains(script, root) {
 		t.Fatalf("spawn script missing FLOW_ROOT propagation; got:\n%s", script)
@@ -484,7 +481,7 @@ func TestCmdDoFreshHarnessCodexReplacesPinnedClaudeTask(t *testing.T) {
 	}
 }
 
-func TestCmdDoHarnessCodexBootstrapFailureRollsBackFreshBind(t *testing.T) {
+func TestCmdDoHarnessCodexSpawnFailureRollsBackFreshBind(t *testing.T) {
 	cases := []struct {
 		name        string
 		prePin      string
@@ -510,7 +507,17 @@ func TestCmdDoHarnessCodexBootstrapFailureRollsBackFreshBind(t *testing.T) {
 			setupFlowRoot(t)
 			slug := tc.args[0]
 			seedTask(t, slug)
-			spawns, _ := stubITerm(t)
+			var spawns int64
+			oldRunner := iterm.Runner
+			iterm.Runner = func(args []string) error {
+				atomic.AddInt64(&spawns, 1)
+				return errors.New("simulated spawn failure")
+			}
+			t.Cleanup(func() { iterm.Runner = oldRunner })
+			oldOverride := spawner.Override
+			spawner.Override = spawner.BackendITerm
+			t.Cleanup(func() { spawner.Override = oldOverride })
+
 			db := openFlowDB(t)
 			if tc.prePin != "" {
 				if _, err := db.Exec(
@@ -525,8 +532,6 @@ func TestCmdDoHarnessCodexBootstrapFailureRollsBackFreshBind(t *testing.T) {
 				switch call {
 				case 1:
 					return []byte(`{"type":"thread.started","thread_id":"018f3f8e-97f7-7cc2-a871-bfbfd8f4fd40"}` + "\n"), nil
-				case 2:
-					return nil, errors.New("bootstrap blew up")
 				default:
 					t.Fatalf("unexpected codex call %d", call)
 					return nil, nil
@@ -537,11 +542,11 @@ func TestCmdDoHarnessCodexBootstrapFailureRollsBackFreshBind(t *testing.T) {
 			if rc := cmdDo(tc.args); rc != 1 {
 				t.Fatalf("cmdDo rc=%d, want 1", rc)
 			}
-			if !strings.Contains(stderr(), "bootstrap session") {
-				t.Fatalf("stderr missing bootstrap failure")
+			if !strings.Contains(stderr(), "simulated spawn failure") {
+				t.Fatalf("stderr missing spawn failure: %s", stderr())
 			}
-			if got := atomic.LoadInt64(spawns); got != 0 {
-				t.Fatalf("spawn count=%d, want 0", got)
+			if got := atomic.LoadInt64(&spawns); got != 1 {
+				t.Fatalf("spawn count=%d, want 1 attempted spawn", got)
 			}
 
 			task, err := flowdb.GetTask(db, slug)

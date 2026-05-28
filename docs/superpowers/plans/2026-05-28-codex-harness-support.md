@@ -62,9 +62,7 @@ sequenceDiagram
   F->>C: codex exec --json --skip-git-repo-check allocation prompt
   C-->>F: thread.started { thread_id }
   F->>DB: Bind task to harness=codex and session_id
-  F->>C: codex exec resume --skip-git-repo-check id bootstrap prompt
-  C-->>F: bootstrap finished
-  F->>T: codex resume id
+  F->>T: codex resume id bootstrap prompt
 ```
 
 ## File Map
@@ -923,18 +921,11 @@ func (c *codex) PrepareFreshSession(ctx harness.SessionContext, prompt string, o
 	}
 	return harness.PreparedSession{
 		SessionID:      id,
-		LaunchCommand: "codex resume " + id,
+		LaunchCommand: c.launchFreshCmd(id, prompt, opts),
 	}, nil
 }
 
 func (c *codex) BootstrapFreshSession(ctx harness.SessionContext, sessionID, prompt string, opts harness.LaunchOpts) error {
-	if opts.Inject != "" {
-		prompt = prompt + "\n\n" + harness.InjectionMarker + "\n" + opts.Inject
-	}
-	_, err := CommandRunner(ctx, execResumeArgs(sessionID, prompt, opts))
-	if err != nil {
-		return fmt.Errorf("codex bootstrap thread %s: %w", sessionID, err)
-	}
 	return nil
 }
 ```
@@ -944,7 +935,7 @@ Implement resume:
 ```go
 func (c *codex) ResumeCmd(sessionID string, opts harness.LaunchOpts) string {
 	if opts.Inject == "" {
-		return "codex resume " + sessionID
+		return codexResumeBaseCmd(sessionID, opts)
 	}
 	inject := harness.InjectionMarker + "\n" + opts.Inject
 	cmd := "codex exec resume --skip-git-repo-check"
@@ -952,7 +943,7 @@ func (c *codex) ResumeCmd(sessionID string, opts harness.LaunchOpts) string {
 		cmd += " --dangerously-bypass-approvals-and-sandbox"
 	}
 	cmd += " " + sessionID + " " + spawner.ShellQuote(inject)
-	return cmd + " && codex resume " + sessionID
+	return cmd + " && " + codexResumeBaseCmd(sessionID, opts)
 }
 ```
 
@@ -1115,7 +1106,7 @@ Add these focused tests in the same file:
 ```go
 func TestPrepareFreshSessionReturnsRunnerError(t *testing.T)
 func TestPrepareFreshSessionRequiresThreadStarted(t *testing.T)
-func TestBootstrapFreshSessionAppendsInjection(t *testing.T)
+func TestBootstrapFreshSessionIsNoop(t *testing.T)
 func TestResumeCmdWithInjectionExecsThenResumes(t *testing.T)
 func TestDangerousFlagMapsToBypassApprovalsAndSandbox(t *testing.T)
 func TestSkipPermissionsRunUsesDangerousExec(t *testing.T)
@@ -1209,7 +1200,7 @@ git commit -m "feat: add codex harness adapter"
 
 - [ ] **Step 1: Finalize fresh and resume behavior in `cmdDo`**
 
-Keep the Task 1 lifecycle order exactly: build `prompt`, `launchOpts`, and `sessionCtx`; run `PrepareFreshSession` outside the write transaction when the outside snapshot needs a fresh session; open the transaction and re-read the row; bind with a compare-and-swap update; commit; run `BootstrapFreshSession`; then spawn.
+Keep the Task 1 lifecycle order exactly: build `prompt`, `launchOpts`, and `sessionCtx`; run `PrepareFreshSession` outside the write transaction when the outside snapshot needs a fresh session; open the transaction and re-read the row; bind with a compare-and-swap update; commit; run `BootstrapFreshSession`; then spawn. For Codex, `BootstrapFreshSession` is intentionally a no-op because the launch command passes the real bootstrap prompt to interactive `codex resume`.
 
 With Codex registered, the post-commit branch should be:
 

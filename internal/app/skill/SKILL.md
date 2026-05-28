@@ -1901,9 +1901,9 @@ handed to the user. For Claude, flow pre-allocates a UUID and passes it
 to `claude --session-id <uuid>`, which writes the jsonl transcript at
 `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`. For Codex, flow first
 asks `codex exec --json` to allocate a thread, stores the emitted
-thread id, bootstraps the task with `codex exec resume <id> ...`, and
-then opens `codex resume <id>` interactively. Codex transcripts live
-under `$CODEX_HOME/sessions` or `~/.codex/sessions`.
+thread id, and opens `codex resume <id> <bootstrap-prompt>`
+interactively in the spawned terminal tab. Codex transcripts live under
+`$CODEX_HOME/sessions` or `~/.codex/sessions`.
 
 There is no self-registration step — the DB is authoritative from the
 moment the session is bound. Subsequent `flow do <same-task>` calls read

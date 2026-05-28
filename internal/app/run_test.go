@@ -262,8 +262,6 @@ func TestCmdRunPlaybookHarnessCodexAllocatesAndPinsRunTask(t *testing.T) {
 		switch call {
 		case 1:
 			return []byte(`{"type":"thread.started","thread_id":"` + sid + `"}` + "\n"), nil
-		case 2:
-			return nil, nil
 		default:
 			t.Fatalf("unexpected codex call %d: %q", call, args)
 			return nil, nil

@@ -69,7 +69,7 @@ func TestPrepareFreshSessionParsesThreadStarted(t *testing.T) {
 	})
 
 	ctx := harness.SessionContext{WorkDir: "/tmp/work", Env: []string{"FLOW_ROOT=/tmp/flow-root"}}
-	got, err := New().PrepareFreshSession(ctx, "bootstrap prompt should be ignored for allocation", harness.LaunchOpts{})
+	got, err := New().PrepareFreshSession(ctx, "bootstrap prompt should launch interactively", harness.LaunchOpts{})
 	if err != nil {
 		t.Fatalf("PrepareFreshSession: %v", err)
 	}
@@ -89,8 +89,29 @@ func TestPrepareFreshSessionParsesThreadStarted(t *testing.T) {
 	if got.SessionID != testThreadID {
 		t.Fatalf("SessionID=%q, want %q", got.SessionID, testThreadID)
 	}
-	if got.LaunchCommand != "codex resume "+testThreadID {
+	wantLaunch := "codex resume " + testThreadID + " 'bootstrap prompt should launch interactively'"
+	if got.LaunchCommand != wantLaunch {
 		t.Fatalf("LaunchCommand=%q", got.LaunchCommand)
+	}
+}
+
+func TestPrepareFreshSessionLaunchCommandIncludesInjectionAndDangerousResume(t *testing.T) {
+	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
+		return []byte(`{"type":"thread.started","thread_id":"` + testThreadID + `"}` + "\n"), nil
+	})
+
+	got, err := New().PrepareFreshSession(
+		harness.SessionContext{},
+		"bootstrap",
+		harness.LaunchOpts{SkipPermissions: true, Inject: "follow up"},
+	)
+	if err != nil {
+		t.Fatalf("PrepareFreshSession: %v", err)
+	}
+	wantPrompt := "bootstrap\n\n" + harness.InjectionMarker + "\nfollow up"
+	wantLaunch := "codex resume --dangerously-bypass-approvals-and-sandbox " + testThreadID + " '" + wantPrompt + "'"
+	if got.LaunchCommand != wantLaunch {
+		t.Fatalf("LaunchCommand=\n%q\nwant\n%q", got.LaunchCommand, wantLaunch)
 	}
 }
 
@@ -172,11 +193,10 @@ func TestPrepareFreshSessionParsesNestedThreadStartedForCompatibility(t *testing
 	}
 }
 
-func TestBootstrapFreshSessionArgsAndInjection(t *testing.T) {
-	var gotArgs []string
+func TestBootstrapFreshSessionIsNoop(t *testing.T) {
 	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
-		gotArgs = append([]string(nil), args...)
-		return nil, nil
+		t.Fatalf("BootstrapFreshSession should not run codex headlessly; args=%q", args)
+		return nil, errors.New("unexpected runner call")
 	})
 
 	err := New().BootstrapFreshSession(
@@ -188,34 +208,12 @@ func TestBootstrapFreshSessionArgsAndInjection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BootstrapFreshSession: %v", err)
 	}
-	wantPrompt := "bootstrap\n\n" + harness.InjectionMarker + "\nextra"
-	wantArgs := []string{
-		"exec",
-		"resume",
-		"--skip-git-repo-check",
-		"--dangerously-bypass-approvals-and-sandbox",
-		testThreadID,
-		wantPrompt,
-	}
-	if !slices.Equal(gotArgs, wantArgs) {
-		t.Fatalf("args=%q, want %q", gotArgs, wantArgs)
-	}
-}
-
-func TestBootstrapFreshSessionWrapsRunnerError(t *testing.T) {
-	stubCommandRunner(t, func(ctx harness.SessionContext, args []string) ([]byte, error) {
-		return nil, errors.New("runner failed")
-	})
-	err := New().BootstrapFreshSession(harness.SessionContext{}, testThreadID, "bootstrap", harness.LaunchOpts{})
-	if err == nil || !strings.Contains(err.Error(), "codex bootstrap thread "+testThreadID) || !strings.Contains(err.Error(), "runner failed") {
-		t.Fatalf("err=%v, want contextual runner error", err)
-	}
 }
 
 func TestResumeCmdWithInjectionExecsThenResumes(t *testing.T) {
 	got := New().ResumeCmd(testThreadID, harness.LaunchOpts{SkipPermissions: true, Inject: "follow up"})
 	want := "codex exec resume --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox " +
-		testThreadID + " '" + harness.InjectionMarker + "\nfollow up' && codex resume " + testThreadID
+		testThreadID + " '" + harness.InjectionMarker + "\nfollow up' && codex resume --dangerously-bypass-approvals-and-sandbox " + testThreadID
 	if got != want {
 		t.Fatalf("ResumeCmd=\n%q\nwant\n%q", got, want)
 	}
@@ -225,6 +223,14 @@ func TestResumeCmdWithoutInjection(t *testing.T) {
 	got := New().ResumeCmd(testThreadID, harness.LaunchOpts{})
 	if got != "codex resume "+testThreadID {
 		t.Fatalf("ResumeCmd=%q", got)
+	}
+}
+
+func TestResumeCmdWithoutInjectionDangerous(t *testing.T) {
+	got := New().ResumeCmd(testThreadID, harness.LaunchOpts{SkipPermissions: true})
+	want := "codex resume --dangerously-bypass-approvals-and-sandbox " + testThreadID
+	if got != want {
+		t.Fatalf("ResumeCmd=%q, want %q", got, want)
 	}
 }
 

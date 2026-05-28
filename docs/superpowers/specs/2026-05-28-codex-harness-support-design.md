@@ -172,11 +172,12 @@ Codex implementation:
 - Return `PreparedSession` only if the process exits successfully. If the
   allocation process exits non-zero after emitting a thread id, Flow must report
   the allocation error and must not bind the task row to that id.
-- Return launch command `codex resume <id>`.
-- `BootstrapFreshSession` runs the real Flow bootstrap synchronously with
-  `codex exec resume <id> <prompt>` after Flow has bound the task row and before
-  Flow spawns the interactive terminal.
-- Both Codex subprocesses run in `ctx.WorkDir` and inherit `ctx.Env`.
+- Return launch command `codex resume <id> <bootstrap-prompt>` so the real Flow
+  bootstrap runs in the spawned interactive terminal tab.
+- Implement `BootstrapFreshSession` as a no-op for Codex. The only headless
+  Codex process in the fresh path is the inert allocation prompt.
+- The allocation subprocess runs in `ctx.WorkDir` and inherits `ctx.Env`; the
+  interactive resume runs in the spawned terminal at the task workdir.
 
 The minimal allocation prompt is:
 
@@ -203,8 +204,9 @@ Current Codex behavior from the OpenAI Codex source and docs:
 - Codex exposes `CODEX_THREAD_ID` in shell/tool environments.
 - Codex thread/session ids are UUIDs generated as UUIDv7.
 - `codex exec --json` emits `thread.started` with `thread_id`.
-- `codex exec resume <id> <prompt>` accepts a prompt.
-- Interactive `codex resume <id>` does not accept a prompt.
+- Interactive `codex resume <id> <prompt>` accepts a prompt.
+- `codex exec resume <id> <prompt>` also accepts a prompt for existing-session
+  `--with` injection and close-out sweeps.
 - Codex rollouts live under `$CODEX_HOME/sessions/YYYY/MM/DD/`.
 - Codex `exec` calls launched by Flow should include
   `--skip-git-repo-check` so tasks in non-git work directories behave like
@@ -222,35 +224,25 @@ sequenceDiagram
   F->>C: codex exec --json --skip-git-repo-check <minimal allocation prompt>
   C-->>F: thread.started { thread_id }
   F->>DB: write harness=codex, session_id=thread_id, status=in-progress and commit
-  F->>C: codex exec resume --skip-git-repo-check <thread_id> <real Flow bootstrap prompt>
-  C-->>F: bootstrap turn complete
-  F->>T: codex resume <thread_id>
+  F->>T: codex resume <thread_id> <real Flow bootstrap prompt>
 ```
 
 This avoids the earlier flawed sequence where the real Flow bootstrap prompt
-ran before the task row was bound. The real bootstrap can safely call
-`flow show task` with no explicit ref because the resumed Codex turn receives
-`CODEX_THREAD_ID` and Flow can reverse-lookup the task.
+ran before the interactive tab existed. The real bootstrap can safely call
+`flow show task` with no explicit ref because it runs inside the resumed Codex
+session, which receives `CODEX_THREAD_ID`, and Flow can reverse-lookup the task.
 
-If the bootstrap resume step fails after the DB row is written, Flow should
-roll back the fresh bind when it can do so safely with the same compare-and-swap
-pattern used by the existing fresh-spawn failure path. If rollback fails because
-the row changed concurrently, Flow should report the failure and leave the row
-untouched rather than guessing.
-
-The real bootstrap step is not part of the terminal launch command. Flow runs it
-synchronously so Flow can observe failure and apply the rollback rule above.
-The task bind must be committed before Flow starts the bootstrap subprocess,
-because that subprocess runs `flow show task` as a separate process and must be
-able to observe the session row. The fresh Codex order is therefore: mint thread,
-bind in a transaction, commit, run bootstrap, and use a post-commit
-compare-and-swap rollback if bootstrap fails.
+If terminal spawn fails after the DB row is written, Flow should roll back the
+fresh bind when it can do so safely with the same compare-and-swap pattern used
+by the existing fresh-spawn failure path. If rollback fails because the row
+changed concurrently, Flow should report the failure and leave the row untouched
+rather than guessing.
 
 Fresh `--with` behavior:
 
 - For Claude, the injection text remains appended to the first launch prompt.
-- For Codex fresh sessions, `BootstrapFreshSession` sends one resumed exec turn
-  containing the Flow bootstrap prompt plus `harness.InjectionMarker` and the
+- For Codex fresh sessions, the interactive `codex resume <id> <prompt>` launch
+  contains the Flow bootstrap prompt plus `harness.InjectionMarker` and the
   injection text.
 - For Codex resume of an existing task, injection remains a separate
   `codex exec resume <id> <injection>` before interactive `codex resume <id>`.
@@ -260,6 +252,9 @@ Resume behavior:
 - No injection: `codex resume <id>`
 - With `--with`: `codex exec resume --skip-git-repo-check <id>
   <injection prompt>` followed by `codex resume <id>`
+- With `--dangerously-skip-permissions`, both the exec injection command and
+  final interactive resume include Codex's
+  `--dangerously-bypass-approvals-and-sandbox` flag.
 
 Permission bypass:
 

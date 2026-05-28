@@ -327,10 +327,10 @@ A SessionStart hook re-injects the task brief, updates, and repo
 instruction context on every resume.
 
 For the Codex harness, flow asks `codex exec --json` for a thread id,
-stores it in the task row, bootstraps the task with `codex exec resume
-<id>`, and opens `codex resume <id>` interactively. Codex exposes the
-current thread as `$CODEX_THREAD_ID`; transcripts render from Codex
-rollout logs under `$CODEX_HOME/sessions` or `~/.codex/sessions`.
+stores it in the task row, and opens `codex resume <id> <bootstrap-prompt>`
+interactively in the spawned terminal tab. Codex exposes the current
+thread as `$CODEX_THREAD_ID`; transcripts render from Codex rollout logs
+under `$CODEX_HOME/sessions` or `~/.codex/sessions`.
 
 When `flow do <task>` is run for a task whose session is already
 live in another tab, flow focuses that tab instead of spawning a

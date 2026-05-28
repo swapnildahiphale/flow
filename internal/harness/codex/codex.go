@@ -77,36 +77,39 @@ func (c *codex) PrepareFreshSession(ctx harness.SessionContext, prompt string, o
 	threadID = strings.ToLower(threadID)
 	return harness.PreparedSession{
 		SessionID:     threadID,
-		LaunchCommand: c.ResumeCmd(threadID, harness.LaunchOpts{}),
+		LaunchCommand: c.launchFreshCmd(threadID, prompt, opts),
 	}, nil
 }
 
 func (c *codex) BootstrapFreshSession(ctx harness.SessionContext, sessionID, prompt string, opts harness.LaunchOpts) error {
+	return nil
+}
+
+func (c *codex) launchFreshCmd(sessionID, prompt string, opts harness.LaunchOpts) string {
 	if opts.Inject != "" {
 		prompt += "\n\n" + harness.InjectionMarker + "\n" + opts.Inject
 	}
-	args := []string{"exec", "resume", "--skip-git-repo-check"}
-	if opts.SkipPermissions {
-		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
-	}
-	args = append(args, sessionID, prompt)
-	_, err := CommandRunner(ctx, args)
-	if err != nil {
-		return fmt.Errorf("codex bootstrap thread %s: %w", sessionID, err)
-	}
-	return nil
+	return codexResumeBaseCmd(sessionID, opts) + " " + spawner.ShellQuote(prompt)
 }
 
 func (c *codex) ResumeCmd(sessionID string, opts harness.LaunchOpts) string {
 	if opts.Inject == "" {
-		return "codex resume " + sessionID
+		return codexResumeBaseCmd(sessionID, opts)
 	}
 	args := "codex exec resume --skip-git-repo-check"
 	if opts.SkipPermissions {
 		args += " --dangerously-bypass-approvals-and-sandbox"
 	}
 	args += " " + sessionID + " " + spawner.ShellQuote(harness.InjectionMarker+"\n"+opts.Inject)
-	return args + " && codex resume " + sessionID
+	return args + " && " + codexResumeBaseCmd(sessionID, opts)
+}
+
+func codexResumeBaseCmd(sessionID string, opts harness.LaunchOpts) string {
+	cmd := "codex resume"
+	if opts.SkipPermissions {
+		cmd += " --dangerously-bypass-approvals-and-sandbox"
+	}
+	return cmd + " " + sessionID
 }
 
 func (c *codex) SkipPermissionsRun(ctx harness.SessionContext, prompt string) error {

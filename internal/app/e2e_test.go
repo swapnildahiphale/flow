@@ -268,8 +268,6 @@ func TestE2ECodexHarnessRoundtrip(t *testing.T) {
 			return []byte(`{"type":"thread.started","thread_id":"` + sid + `"}` + "\n"), nil
 		case 2:
 			return nil, nil
-		case 3:
-			return nil, nil
 		default:
 			t.Fatalf("unexpected codex call %d: %q", call, args)
 			return nil, nil
@@ -308,6 +306,12 @@ func TestE2ECodexHarnessRoundtrip(t *testing.T) {
 	if script := getScript(); !strings.Contains(script, "codex resume "+sid) {
 		t.Fatalf("spawn script missing codex resume: %s", script)
 	} else {
+		if strings.Contains(script, "codex exec resume") {
+			t.Fatalf("fresh codex spawn should not run headless bootstrap: %s", script)
+		}
+		if !strings.Contains(script, "execution session for flow task codex-smoke") {
+			t.Fatalf("spawn script missing interactive bootstrap prompt: %s", script)
+		}
 		for key, value := range map[string]string{"FLOW_ROOT": flowRoot, "HOME": tmp, "CODEX_HOME": codexHome} {
 			needle := key + "='" + value + "'"
 			if !strings.Contains(script, needle) {
@@ -340,10 +344,10 @@ func TestE2ECodexHarnessRoundtrip(t *testing.T) {
 	if task.Status != "done" {
 		t.Fatalf("status after done: got %q, want done", task.Status)
 	}
-	if len(*calls) != 3 {
-		t.Fatalf("codex calls=%d, want 3 (%#v)", len(*calls), *calls)
+	if len(*calls) != 2 {
+		t.Fatalf("codex calls=%d, want 2 (%#v)", len(*calls), *calls)
 	}
-	if got := (*calls)[2].args; len(got) < 4 || got[0] != "exec" || !strings.Contains(got[3], "flow transcript codex-smoke") {
+	if got := (*calls)[1].args; len(got) < 4 || got[0] != "exec" || !strings.Contains(got[3], "flow transcript codex-smoke") {
 		t.Fatalf("codex close-out args=%q", got)
 	}
 }
