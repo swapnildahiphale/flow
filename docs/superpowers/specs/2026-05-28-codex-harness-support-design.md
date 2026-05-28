@@ -302,7 +302,10 @@ explicit task ref because these commands do not accept a harness selector today.
 Add `--harness claude|codex` to `flow run playbook` and forward it to the
 generated run task's `flow do` path. This keeps playbook runs usable from a
 plain terminal for Codex users. If omitted, playbook run harness selection uses
-the same precedence as `flow do`: ambient harness, then Claude default.
+the same precedence as `flow do`: ambient harness, then Claude default. If the
+delegated `flow do` fails before a usable session is spawned, remove the newly
+created playbook-run row and its snapshotted task directory so a failed Codex
+preflight does not leave a dangling run.
 
 ## Database Design
 

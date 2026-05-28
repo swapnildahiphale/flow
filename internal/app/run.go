@@ -240,7 +240,44 @@ func cmdRunPlaybook(args []string) int {
 	if *withFile != "" {
 		doArgs = append(doArgs, "--with-file", *withFile)
 	}
-	return cmdDo(doArgs)
+	rc := cmdDo(doArgs)
+	if rc != 0 {
+		cleanupPlaybookRunAfterFailedSpawn(dbPath, root, runSlug)
+	}
+	return rc
+}
+
+func cleanupPlaybookRunAfterFailedSpawn(dbPath, root, runSlug string) {
+	db, err := openConcurrentDB(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cleanup failed playbook run %q: %v\n", runSlug, err)
+		return
+	}
+	defer db.Close()
+
+	res, err := db.Exec(
+		`DELETE FROM tasks
+		 WHERE slug=?
+		   AND kind='playbook_run'
+		   AND status='backlog'
+		   AND (session_id IS NULL OR session_id='')`,
+		runSlug,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cleanup failed playbook run %q: %v\n", runSlug, err)
+		return
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cleanup failed playbook run %q: %v\n", runSlug, err)
+		return
+	}
+	if affected == 0 {
+		return
+	}
+	if err := os.RemoveAll(filepath.Join(root, "tasks", runSlug)); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cleanup failed playbook run files %q: %v\n", runSlug, err)
+	}
 }
 
 // generateRunSlug computes the unique slug for a new playbook run.

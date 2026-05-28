@@ -677,6 +677,12 @@ if explicitHarness != "" {
 }
 ```
 
+After delegating to `cmdDo`, if the spawn path returns non-zero, delete the
+newly inserted backlog `playbook_run` row and remove its snapshotted
+`tasks/<run-slug>/` directory when no session id was bound. This covers Codex
+resume-prompt preflight failures and terminal spawn failures without deleting a
+run that successfully claimed a session.
+
 - [ ] **Step 5: Update no-ref transcript and show paths**
 
 Update `cmdTranscript` and any no-ref `flow show task` helper to distinguish:

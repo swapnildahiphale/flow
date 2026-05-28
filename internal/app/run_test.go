@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -287,6 +288,41 @@ func TestCmdRunPlaybookHarnessCodexAllocatesAndPinsRunTask(t *testing.T) {
 	}
 	if script := getScript(); !strings.Contains(script, "codex resume "+sid) {
 		t.Fatalf("spawn script missing codex resume: %s", script)
+	}
+}
+
+func TestCmdRunPlaybookHarnessCodexResumePromptSupportFailureCleansRunTask(t *testing.T) {
+	root := setupFlowRoot(t)
+	wd := t.TempDir()
+	if rc := cmdAdd([]string{"playbook", "Deploy", "--slug", "deploy", "--work-dir", wd}); rc != 0 {
+		t.Fatal()
+	}
+	stubITerm(t)
+
+	calls := stubCodexCommandRunner(t, func(call int, ctx harness.SessionContext, args []string) ([]byte, error) {
+		if call != 1 || !slices.Equal(args, []string{"resume", "--help"}) {
+			t.Fatalf("unexpected codex call %d: %q", call, args)
+		}
+		return []byte("Usage: codex resume [OPTIONS] [SESSION_ID]\n"), nil
+	})
+
+	stderr := captureStderr(t)
+	if rc := cmdRun([]string{"playbook", "deploy", "--harness", "codex"}); rc != 1 {
+		t.Fatalf("cmdRun rc=%d, want 1", rc)
+	}
+	if !strings.Contains(stderr(), "codex resume prompt support") {
+		t.Fatalf("stderr missing prompt support error: %s", stderr())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("codex calls=%d, want only resume help (%#v)", len(*calls), *calls)
+	}
+	assertNoPlaybookRunRows(t, "deploy")
+	matches, err := filepath.Glob(filepath.Join(root, "tasks", "deploy--*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("run task dirs=%v, want cleaned up", matches)
 	}
 }
 
