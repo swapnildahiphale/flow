@@ -4,6 +4,7 @@ package flowdb
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -56,6 +57,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id            TEXT,
     session_started       TEXT,
     session_last_resumed  TEXT,
+    harness               TEXT,
+    auto_run_status       TEXT,
+    auto_run_pid          INTEGER,
+    auto_run_started      TEXT,
+    auto_run_finished     TEXT,
+    auto_run_log          TEXT,
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
     archived_at           TEXT,
@@ -78,6 +85,24 @@ CREATE TABLE IF NOT EXISTS task_tags (
     PRIMARY KEY (task_slug, tag)
 );
 
+CREATE TABLE IF NOT EXISTS owners (
+    slug              TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    work_dir          TEXT NOT NULL,
+    project_slug      TEXT REFERENCES projects(slug),
+    status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','retired')),
+    every             TEXT NOT NULL,
+    next_wake_at      TEXT,
+    last_tick_at      TEXT,
+    last_tick_status  TEXT,
+    tick_pid          INTEGER,
+    tick_started      TEXT,
+    harness           TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    archived_at       TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_project    ON tasks(project_slug);
 CREATE INDEX IF NOT EXISTS idx_tasks_status     ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
@@ -92,8 +117,13 @@ const indexesPostMigrate = `
 CREATE INDEX IF NOT EXISTS idx_tasks_kind          ON tasks(kind);
 CREATE INDEX IF NOT EXISTS idx_tasks_playbook_slug ON tasks(playbook_slug);
 CREATE INDEX IF NOT EXISTS idx_playbooks_project   ON playbooks(project_slug);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id) WHERE session_id IS NOT NULL;
 `
+
+// (idx_tasks_session_id is a partial UNIQUE index that requires a
+// dedupe pass against existing data — a flat CREATE UNIQUE INDEX
+// would fail on any DB that has two tasks sharing a session_id.
+// migrateTasksSessionIDUnique handles both the dedupe and the index
+// creation as one idempotent step.)
 
 // ---------- models ----------
 
@@ -126,9 +156,25 @@ type Task struct {
 	SessionID          sql.NullString
 	SessionStarted     sql.NullString
 	SessionLastResumed sql.NullString
-	CreatedAt          string
-	UpdatedAt          string
-	ArchivedAt         sql.NullString
+	// Harness records which agent CLI (claude/codex/gemini/…) owns the
+	// task's session. NULL/empty is treated as "claude" by callers — a
+	// back-compat convention so pre-harness-column DBs Just Work.
+	// Set on first `flow do` or `flow do --here` from the ambient
+	// harness's session env var; immutable afterward.
+	Harness sql.NullString
+	// Autonomous-run bookkeeping (set by `flow do --auto`). AutoRunStatus
+	// is NULL for tasks that were never run in --auto mode; otherwise one
+	// of 'running' | 'completed' | 'dead'. AutoRunPID is the detached
+	// supervisor process's PID (used for read-time liveness reconciliation
+	// while status='running'); cleared on finalize.
+	AutoRunStatus   sql.NullString
+	AutoRunPID      sql.NullInt64
+	AutoRunStarted  sql.NullString
+	AutoRunFinished sql.NullString
+	AutoRunLog      sql.NullString
+	CreatedAt       string
+	UpdatedAt       string
+	ArchivedAt      sql.NullString
 }
 
 // Workdir mirrors the workdirs convenience registry.
@@ -148,7 +194,8 @@ type TaskFilter struct {
 	Priority        string
 	Kind            string // "regular" (default), "playbook_run", or "" for all
 	PlaybookSlug    string // optional; filter to runs of one playbook
-	Tag             string // optional; only tasks carrying this tag (already normalized)
+	Tag             string   // optional; only tasks carrying this tag (already normalized)
+	Tags            []string // optional; tasks must carry ALL of these (intersection; already normalized)
 	Since           string // RFC3339 or "" for no lower bound
 	IncludeArchived bool
 	ExcludeDone     bool // hide status=done; ignored if Status is set explicitly
@@ -177,8 +224,18 @@ func NullIfEmpty(s string) any {
 
 // OpenDB opens (or creates) the SQLite database at path, ensures the
 // schema is present, and runs idempotent migrations.
+//
+// The connection is opened with busy_timeout(30000) applied via the
+// DSN so every pooled connection inherits it. Without this, concurrent
+// `flow do` invocations can race during the schema-DDL / migration
+// setup here and the loser gets SQLITE_BUSY immediately instead of
+// waiting — surfaces as a flaky `migrate: pragma table_info(...):
+// database is locked` on slow runners.
 func OpenDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	q := url.Values{}
+	q.Set("_pragma", "busy_timeout(30000)")
+	dsn := "file:" + path + "?" + q.Encode()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %s: %w", path, err)
 	}
@@ -262,12 +319,66 @@ func runMigrations(db *sql.DB) error {
 		}
 	}
 
+	// tasks.harness: nullable, no backfill. NULL is the back-compat
+	// signal for "claude" — every row that existed before this column
+	// landed reads as claude in the app layer. New rows get filled in
+	// on first `flow do` / `flow do --here` from the ambient harness.
+	has, err = columnExists(db, "tasks", "harness")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := db.Exec(`ALTER TABLE tasks ADD COLUMN harness TEXT`); err != nil {
+			return fmt.Errorf("add tasks.harness: %w", err)
+		}
+	}
+
 	// Session-id invariant: any non-backlog task must have a session_id.
 	// Adds a CHECK to the tasks table; old DBs need a table rebuild.
-	// Runs before indexesPostMigrate so the partial unique index lands
-	// on the rebuilt table.
 	if err := migrateTasksSessionInvariant(db); err != nil {
 		return fmt.Errorf("migrate session invariant: %w", err)
+	}
+
+	// Autonomous-run bookkeeping columns (feat: flow do --auto). Added
+	// AFTER the session-invariant rebuild so that rebuild (which only
+	// copies the pre-existing column set) doesn't need to know about
+	// them — they land here via plain ALTER on the rebuilt table. All
+	// nullable, no CHECK (SQLite can't add CHECK via ALTER; status enum
+	// is validated in application code).
+	for _, col := range []struct{ name, ddl string }{
+		{"auto_run_status", "ALTER TABLE tasks ADD COLUMN auto_run_status TEXT"},
+		{"auto_run_pid", "ALTER TABLE tasks ADD COLUMN auto_run_pid INTEGER"},
+		{"auto_run_started", "ALTER TABLE tasks ADD COLUMN auto_run_started TEXT"},
+		{"auto_run_finished", "ALTER TABLE tasks ADD COLUMN auto_run_finished TEXT"},
+		{"auto_run_log", "ALTER TABLE tasks ADD COLUMN auto_run_log TEXT"},
+	} {
+		has, err := columnExists(db, "tasks", col.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := db.Exec(col.ddl); err != nil {
+				return fmt.Errorf("add tasks.%s: %w", col.name, err)
+			}
+		}
+	}
+
+	// owners: live-tick bookkeeping columns (the tick-running indicator).
+	// Fresh DBs get these from schemaDDL; DBs whose owners table predates
+	// the columns get them via ALTER. All nullable.
+	for _, col := range []struct{ name, ddl string }{
+		{"tick_pid", "ALTER TABLE owners ADD COLUMN tick_pid INTEGER"},
+		{"tick_started", "ALTER TABLE owners ADD COLUMN tick_started TEXT"},
+	} {
+		has, err := columnExists(db, "owners", col.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := db.Exec(col.ddl); err != nil {
+				return fmt.Errorf("add owners.%s: %w", col.name, err)
+			}
+		}
 	}
 
 	// Indexes that depend on columns added above. Safe to run after every
@@ -275,6 +386,127 @@ func runMigrations(db *sql.DB) error {
 	// this point all referenced columns exist.
 	if _, err := db.Exec(indexesPostMigrate); err != nil {
 		return fmt.Errorf("create post-migrate indexes: %w", err)
+	}
+
+	// Session-id uniqueness: dedupe any tasks sharing a session_id, then
+	// create the partial unique index. Runs after the basic indexes
+	// because it has its own dedupe-first contract; a naive
+	// CREATE UNIQUE INDEX in indexesPostMigrate would fail on a DB with
+	// pre-existing duplicates.
+	if err := migrateTasksSessionIDUnique(db); err != nil {
+		return fmt.Errorf("migrate session-id uniqueness: %w", err)
+	}
+	return nil
+}
+
+// migrateTasksSessionIDUnique creates the partial unique index on
+// tasks(session_id) WHERE session_id IS NOT NULL. Older DBs may have
+// two tasks sharing a session_id (the old `flow update task
+// --session-id` flag could silently overwrite a binding without
+// clearing the prior owner; or a user manually edited the row). A
+// flat CREATE UNIQUE INDEX would fail on those DBs, so this function
+// first deduplicates by:
+//
+//  1. Listing every session_id that appears on 2+ tasks.
+//  2. For each such session_id, ordering the carrier tasks by
+//     updated_at DESC, slug ASC. The first row keeps the binding.
+//  3. The remaining rows get session_id=NULL, session_started=NULL,
+//     and status='backlog' (the only state legal for a NULL
+//     session_id under the invariant). A stderr summary explains
+//     which task kept the session and which were demoted.
+//
+// Idempotent: probes sqlite_master for the index first; subsequent
+// calls are no-ops once the index exists.
+func migrateTasksSessionIDUnique(db *sql.DB) error {
+	var existing sql.NullString
+	err := db.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_tasks_session_id'`,
+	).Scan(&existing)
+	if err == nil && existing.Valid {
+		return nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("probe unique index: %w", err)
+	}
+
+	rows, err := db.Query(
+		`SELECT session_id FROM tasks
+		 WHERE session_id IS NOT NULL
+		 GROUP BY session_id
+		 HAVING COUNT(*) > 1
+		 ORDER BY session_id`,
+	)
+	if err != nil {
+		return fmt.Errorf("scan duplicates: %w", err)
+	}
+	var dupedSIDs []string
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			rows.Close()
+			return err
+		}
+		dupedSIDs = append(dupedSIDs, sid)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	if len(dupedSIDs) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"flow migration: deduplicating %d session_id(s) shared across multiple tasks (only one task may carry a given session_id):\n",
+			len(dupedSIDs))
+		now := NowISO()
+		for _, sid := range dupedSIDs {
+			tRows, err := db.Query(
+				`SELECT slug, status FROM tasks
+				 WHERE session_id = ?
+				 ORDER BY updated_at DESC, slug ASC`,
+				sid,
+			)
+			if err != nil {
+				return fmt.Errorf("scan duplicate group %s: %w", sid, err)
+			}
+			type tRow struct{ slug, status string }
+			var carriers []tRow
+			for tRows.Next() {
+				var t tRow
+				if err := tRows.Scan(&t.slug, &t.status); err != nil {
+					tRows.Close()
+					return err
+				}
+				carriers = append(carriers, t)
+			}
+			if err := tRows.Err(); err != nil {
+				tRows.Close()
+				return err
+			}
+			tRows.Close()
+			if len(carriers) < 2 {
+				continue
+			}
+			winner := carriers[0]
+			fmt.Fprintf(os.Stderr,
+				"  %s: keeping on %s (was %s); demoting to backlog with NULL session_id:\n",
+				sid, winner.slug, winner.status)
+			for _, l := range carriers[1:] {
+				fmt.Fprintf(os.Stderr, "    - %s (was %s)\n", l.slug, l.status)
+				if _, err := db.Exec(
+					`UPDATE tasks SET session_id=NULL, session_started=NULL, status='backlog', updated_at=? WHERE slug=?`,
+					now, l.slug,
+				); err != nil {
+					return fmt.Errorf("demote duplicate %s: %w", l.slug, err)
+				}
+			}
+		}
+	}
+
+	if _, err := db.Exec(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id) WHERE session_id IS NOT NULL`,
+	); err != nil {
+		return fmt.Errorf("create unique index: %w", err)
 	}
 	return nil
 }
@@ -372,6 +604,7 @@ func migrateTasksSessionInvariant(db *sql.DB) error {
 			session_id            TEXT,
 			session_started       TEXT,
 			session_last_resumed  TEXT,
+			harness               TEXT,
 			created_at            TEXT NOT NULL,
 			updated_at            TEXT NOT NULL,
 			archived_at           TEXT,
@@ -384,13 +617,13 @@ func migrateTasksSessionInvariant(db *sql.DB) error {
 		INSERT INTO tasks_new (
 			slug, name, project_slug, status, kind, playbook_slug, priority,
 			work_dir, waiting_on, due_date, assignee, status_changed_at,
-			session_id, session_started, session_last_resumed,
+			session_id, session_started, session_last_resumed, harness,
 			created_at, updated_at, archived_at
 		)
 		SELECT
 			slug, name, project_slug, status, kind, playbook_slug, priority,
 			work_dir, waiting_on, due_date, assignee, status_changed_at,
-			session_id, session_started, session_last_resumed,
+			session_id, session_started, session_last_resumed, harness,
 			created_at, updated_at, archived_at
 		FROM tasks`); err != nil {
 		return fmt.Errorf("copy rows: %w", err)
@@ -493,7 +726,7 @@ func ListProjects(db *sql.DB, filter ProjectFilter) ([]*Project, error) {
 
 // ---------- task queries ----------
 
-const TaskCols = "slug, name, project_slug, status, kind, playbook_slug, priority, work_dir, waiting_on, due_date, assignee, status_changed_at, session_id, session_started, session_last_resumed, created_at, updated_at, archived_at"
+const TaskCols = "slug, name, project_slug, status, kind, playbook_slug, priority, work_dir, waiting_on, due_date, assignee, status_changed_at, session_id, session_started, session_last_resumed, harness, auto_run_status, auto_run_pid, auto_run_started, auto_run_finished, auto_run_log, created_at, updated_at, archived_at"
 
 func ScanTask(row interface{ Scan(dest ...any) error }) (*Task, error) {
 	var t Task
@@ -501,7 +734,9 @@ func ScanTask(row interface{ Scan(dest ...any) error }) (*Task, error) {
 		&t.Slug, &t.Name, &t.ProjectSlug, &t.Status, &t.Kind, &t.PlaybookSlug,
 		&t.Priority, &t.WorkDir,
 		&t.WaitingOn, &t.DueDate, &t.Assignee, &t.StatusChangedAt, &t.SessionID,
-		&t.SessionStarted, &t.SessionLastResumed, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt,
+		&t.SessionStarted, &t.SessionLastResumed, &t.Harness,
+		&t.AutoRunStatus, &t.AutoRunPID, &t.AutoRunStarted, &t.AutoRunFinished, &t.AutoRunLog,
+		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -555,6 +790,16 @@ func ListTasks(db *sql.DB, filter TaskFilter) ([]*Task, error) {
 	if filter.Tag != "" {
 		where = append(where, "slug IN (SELECT task_slug FROM task_tags WHERE tag = ?)")
 		args = append(args, filter.Tag)
+	}
+	// Intersection: each tag adds its own EXISTS-style subquery, ANDed
+	// together, so a task must carry EVERY requested tag (e.g.
+	// `--tag owner:x --tag question`).
+	for _, t := range filter.Tags {
+		if t == "" {
+			continue
+		}
+		where = append(where, "slug IN (SELECT task_slug FROM task_tags WHERE tag = ?)")
+		args = append(args, t)
 	}
 	if filter.Since != "" {
 		where = append(where, "updated_at >= ?")

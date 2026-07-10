@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-// cmdShow dispatches `flow show task|project|playbook`. Per spec §5.4.
+// cmdShow dispatches `flow show task|project|playbook|owner`. Per spec §5.4.
 func cmdShow(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "error: show requires 'task', 'project', or 'playbook'")
+		fmt.Fprintln(os.Stderr, "error: show requires 'task', 'project', 'playbook', or 'owner'")
 		return 2
 	}
 	switch args[0] {
@@ -25,6 +25,10 @@ func cmdShow(args []string) int {
 		return showProjectCmd(args[1:])
 	case "playbook":
 		return showPlaybookCmd(args[1:])
+	case "owner":
+		// Verb-first alias for `flow owner show <slug>` — see cmdList's
+		// "owners" case for the rationale.
+		return ownerShow(args[1:])
 	}
 	fmt.Fprintf(os.Stderr, "error: unknown show subcommand %q\n", args[0])
 	return 2
@@ -280,9 +284,11 @@ func printTaskMetadata(db *sql.DB, t *flowdb.Task, root string) {
 	sid := "(not bootstrapped)"
 	if t.SessionID.Valid && t.SessionID.String != "" {
 		sid = t.SessionID.String
-		if live, err := liveClaudeSessions(); err == nil {
-			if live[strings.ToLower(t.SessionID.String)] {
-				sid += "  [live]"
+		if h, err := harnessForTask(t); err == nil {
+			if live, err := h.LiveSessionIDs(); err == nil {
+				if live[strings.ToLower(t.SessionID.String)] > 0 {
+					sid += "  [live]"
+				}
 			}
 		}
 	}
@@ -297,6 +303,48 @@ func printTaskMetadata(db *sql.DB, t *flowdb.Task, root string) {
 		slast = t.SessionLastResumed.String
 	}
 	fmt.Printf("session_last_resumed:  %s\n", slast)
+
+	// Live background-agent status (claude --bg): a per-render
+	// `claude agents --json` lookup. Only prints when the bound session
+	// is currently a running background agent.
+	if a := bgAgentStatus(t); a != nil {
+		line := bgStateLabel(a)
+		if a.PID > 0 {
+			line += fmt.Sprintf(" (pid %d", a.PID)
+			if a.ShortID != "" {
+				line += ", id " + a.ShortID
+			}
+			line += ")"
+		} else if a.ShortID != "" {
+			line += " (id " + a.ShortID + ")"
+		}
+		fmt.Printf("bg_status:             %s\n", line)
+	}
+
+	// Autonomous-run status (only for tasks ever launched with --auto).
+	// Reconcile a stale 'running' whose supervisor died before printing.
+	if t.AutoRunStatus.Valid && t.AutoRunStatus.String != "" {
+		reconcileAutoRun(db, t)
+		line := t.AutoRunStatus.String
+		switch t.AutoRunStatus.String {
+		case "running":
+			if t.AutoRunPID.Valid {
+				line += fmt.Sprintf(" (pid %d", t.AutoRunPID.Int64)
+				if t.AutoRunStarted.Valid && t.AutoRunStarted.String != "" {
+					line += ", since " + t.AutoRunStarted.String
+				}
+				line += ")"
+			}
+		case "completed", "dead":
+			if t.AutoRunFinished.Valid && t.AutoRunFinished.String != "" {
+				line += " (" + t.AutoRunFinished.String + ")"
+			}
+		}
+		fmt.Printf("auto_run:              %s\n", line)
+		if t.AutoRunLog.Valid && t.AutoRunLog.String != "" {
+			fmt.Printf("auto_run_log:          %s\n", t.AutoRunLog.String)
+		}
+	}
 
 	fmt.Printf("created:       %s\n", t.CreatedAt)
 	fmt.Printf("updated:       %s\n", t.UpdatedAt)

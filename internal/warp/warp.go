@@ -1,34 +1,23 @@
 // Package warp provides Warp terminal tab spawning on macOS.
 //
 // Warp has no AppleScript dictionary, no `-e` flag, and no CLI for
-// running commands — see warpdotdev/warp#3364 and discussion #612. The
-// only documented programmatic surface is the URI scheme
-// `warp://action/new_tab?path=<cwd>`, which opens a new tab with cwd
-// set but accepts no command, env vars, or title parameter. Launch
-// configurations (`warp://launch/<name>`) can theoretically run
-// commands, but warpdotdev/warp#9007 (still open) reports that
-// `commands`/`exec` entries silently fail when triggered via URI.
+// running commands (warpdotdev/warp#3364). The only programmatic
+// surface is `warp://action/new_tab?path=<cwd>`, which opens a tab in
+// cwd but accepts no command, env vars, or title. Launch configs
+// can theoretically run commands but silently fail when triggered
+// via URI (warpdotdev/warp#9007).
 //
-// So this backend does the only reliable thing:
+// So SpawnTab does the only reliable thing:
 //
-//  1. Write a self-deleting shell script to a per-user temp directory.
-//     The script sets the tab title via OSC 2, cds to the work_dir,
-//     and `exec env`s the real command with the requested env vars.
-//  2. `open warp://action/new_tab?path=<cwd>` to open a new tab in cwd.
-//  3. `osascript` probes whether Warp was already running, then
-//     `delay 0.3` (warm) or `delay 1.5` (cold) before keystroking
-//     `bash <script-path>` and Return into Warp's front session.
+//  1. Write a self-deleting bootstrap script to os.TempDir(). The
+//     script sets the tab title via OSC 2, cds to work_dir, and
+//     `exec env`s the real command with the requested env vars.
+//  2. `open warp://action/new_tab?path=<cwd>` opens the tab.
+//  3. osascript activates Warp, then keystrokes `bash <script-path>`
+//     + ASCII char 13 into the front session.
 //
-// The keystroke step requires macOS Accessibility for the host
-// process (same gate the Terminal.app backend already needs). When it
-// fails, isAccessibilityDenied + wrapAccessibilityError produce a
-// Warp-specific friendly error pointing at the right System Settings
-// pane.
-//
-// Tests mock Runner (osascript), OpenURL (`open`), WriteScript (temp
-// file write), and removeScript (cleanup on error). Production code
-// never touches the real filesystem or osascript through this
-// package's vars directly.
+// The keystroke step needs macOS Accessibility for Warp — same gate
+// the Terminal.app backend uses.
 package warp
 
 import (
@@ -118,9 +107,6 @@ func SpawnTab(title, cwd, command string, envVars map[string]string) error {
 	uri := "warp://action/new_tab?path=" + url.QueryEscape(cwd)
 	if err := OpenURL(uri); err != nil {
 		_ = removeScript(scriptPath)
-		if isAppNotFound(err) {
-			return wrapAppNotFoundError(err)
-		}
 		return err
 	}
 
@@ -129,9 +115,6 @@ func SpawnTab(title, cwd, command string, envVars map[string]string) error {
 		_ = removeScript(scriptPath)
 		if isAccessibilityDenied(err) {
 			return wrapAccessibilityError(err)
-		}
-		if isAppNotFound(err) {
-			return wrapAppNotFoundError(err)
 		}
 		return err
 	}
@@ -187,63 +170,37 @@ func buildScript(title, cwd, command string, envVars map[string]string) string {
 	return b.String()
 }
 
-// buildAppleScript produces the osascript body that probes whether
-// Warp was already running, delays appropriately (0.3s warm / 1.5s
-// cold), and then keystrokes `bash <scriptPath>` + Return into the
-// front Warp session.
+// buildAppleScript activates Warp, waits for the new tab from
+// `open warp://...` to take key focus, then keystrokes
+// `bash <scriptPath>` + Return into the front Warp session.
 //
-// `open warp://...` is invoked from the Go side (via OpenURL) before
-// this script runs — that's why the script only handles the delay +
-// keystroke half of the spawn.
+// Why `keystroke (ASCII character 13)` instead of `keystroke return`
+// or `key code 36`: Warp v0.2026.04 filters synthetic Return-key
+// events for ~2s after typed input. Empirically:
+//
+//	key code 36              → swallowed (text typed, never submits)
+//	keystroke return         → swallowed
+//	key code 36 + Cmd        → swallowed
+//	paste + key code 36      → swallowed
+//	delay 2.0 + key code 36  → submits (filter window closes)
+//	ASCII character 13       → submits immediately
+//
+// ASCII char 13 flows through Warp's input field to the shell PTY,
+// where the line discipline interprets CR as line submission, before
+// any UI-layer filter fires.
+//
+// `tell application "Warp" to activate` is needed because when flow
+// runs from a non-Warp host (FLOW_TERM=warp, shell script), `open
+// warp://...` opens the new tab but macOS may not foreground Warp —
+// keystrokes would then hit the invoking app. Same guard as
+// terminal.go.
+//
+// Delays calibrated against Warp v0.2026.04:
+//   - 0.6s warm  — focus settle after activate (0.3s misfired on slow boxes).
+//   - 1.8s cold  — cold-start Warp launch.
+//   - 0.5s mid   — between typed text and CR; needed for ~90-char temp paths.
 func buildAppleScript(scriptPath string) string {
 	safePath := escapeAppleScriptString(scriptPath)
-	// Submission sequence:
-	//   1. Activate Warp explicitly so it's the foreground app and
-	//      the new tab has key focus.
-	//   2. Type the `bash <path>` line.
-	//   3. Send `ASCII character 13` (carriage return) via
-	//      `keystroke`, NOT `key code 36` or `keystroke return`.
-	//
-	// Why ASCII character 13 specifically: Warp v0.2026.04 introduced
-	// a synthetic-Return filter that blocks "Return key" events
-	// (virtual key code 36 / the AppleScript `return` constant) for
-	// ~2 seconds after typed input, presumably to prevent
-	// double-submission or AI-suggestion-accept races. Empirically
-	// verified against the user's Warp:
-	//
-	//     key code 36         → swallowed (text typed, never submits)
-	//     keystroke return    → swallowed
-	//     key code 36 + Cmd   → swallowed
-	//     paste + key code 36 → swallowed
-	//     delay 2.0 + key code 36 → submits (filter window closes)
-	//     ASCII character 13      → submits immediately
-	//
-	// ASCII character 13 is treated as a typed character — it flows
-	// through Warp's input field to the shell's PTY where the line
-	// discipline interprets CR as line submission, before any UI
-	// layer's Return-key filter can fire.
-	// Why `tell application "Warp" to activate`: when `flow do` is
-	// invoked from a non-Warp host (e.g. iTerm with FLOW_TERM=warp,
-	// or a shell script), `open warp://...` opens the new tab but
-	// macOS may not foreground Warp itself — focus stays with the
-	// invoking app. The subsequent `tell process "Warp"` keystroke
-	// would then target whichever app IS frontmost (the invoker),
-	// not Warp. The explicit activate guarantees Warp is foreground
-	// before keystrokes fire. The Terminal.app backend has the same
-	// guard at terminal.go for the same reason. (The plan didn't
-	// specify this; it was added during implementation.)
-	//
-	// Timing notes (empirically calibrated against Warp v0.2026.04):
-	//   - 0.6s warm focus delay (after activate, before typing) gives
-	//     the new tab from `open warp://` time to take key focus.
-	//     0.3s sometimes typed into the wrong tab on slower machines.
-	//   - 1.8s cold delay (was 1.5 in the plan) bumped in parallel
-	//     with the warm bump to preserve the warm-vs-cold ratio.
-	//   - 0.5s between typed text and CR gives Warp's input pipeline
-	//     time to settle after the synthetic-keystroke burst. 0.2s
-	//     was enough for short paths but failed on the ~90-char temp
-	//     script paths os.TempDir() produces on macOS — bumping to
-	//     0.5s with significant headroom.
 	return fmt.Sprintf(`set wasRunning to application id "dev.warp.Warp-Stable" is running
 tell application "Warp" to activate
 if wasRunning then
@@ -316,47 +273,6 @@ How to grant it:
 After the grant, future "flow do" invocations from Warp spawn tabs silently with no further prompts.
 
 Underlying osascript error: %w`, err)
-}
-
-// isAppNotFound reports whether an `open`/osascript failure looks
-// like Warp (or its URL handler) is missing on this machine. Matches
-// the macOS Launch Services error fragments surfaced when no app is
-// registered for the warp:// scheme or when an AppleScript
-// `application id` lookup misses.
-func isAppNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	for _, pat := range []string{
-		"LSApplicationNotFoundErr",
-		// AppleScript's "can't get" error capitalizes the C
-		// inconsistently across macOS versions — both forms appear
-		// in the wild. Keep both; do not dedupe.
-		"Can't get application",
-		"can't get application",
-		"no application knows how to open",
-		"(-10814)", // kLSApplicationNotFoundErr
-		"(-1728)",  // AppleScript: can't get
-	} {
-		if strings.Contains(msg, pat) {
-			return true
-		}
-	}
-	return false
-}
-
-// wrapAppNotFoundError returns a friendly install hint when the
-// warp:// URL handler isn't registered (Warp not installed, or the
-// app bundle moved/corrupted).
-func wrapAppNotFoundError(err error) error {
-	return fmt.Errorf(`Warp doesn't appear to be installed, or its warp:// URL handler isn't registered.
-
-Install Warp from https://warp.dev, then re-run the same "flow do" command.
-
-If Warp is installed, try launching it once from /Applications/Warp.app so macOS registers the URL handler.
-
-Underlying error: %w`, err)
 }
 
 // escapeAppleScriptString escapes a string for safe embedding in a

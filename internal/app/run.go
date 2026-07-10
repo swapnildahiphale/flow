@@ -35,10 +35,30 @@ func cmdRunPlaybook(args []string) int {
 	}
 	slug := args[0]
 	fs := flagSet("run playbook")
-	dangerSkip := fs.Bool("dangerously-skip-permissions", false, "pass --dangerously-skip-permissions through to claude")
+	dangerSkip := fs.Bool("dangerously-skip-permissions", false, "skip per-tool approval prompts in the spawned harness (ignored when --here is set)")
+	here := fs.Bool("here", false, "bind THIS Claude session to the new playbook run (no new tab); requires running inside a Claude Code session")
+	auto := fs.Bool("auto", false, "run the playbook headlessly in the background (no tab, no human); the run self-completes via `flow done`")
+	withInstr := fs.String("with", "", "inject `<instruction>` as the run session's first user message (forwarded to flow do)")
+	withFile := fs.String("with-file", "", "inject 'read instructions at <path>' (forwarded to flow do)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
 	}
+
+	// Reject misuse before we materialize the run-task row.
+	if _, rc := loadInjectionText(fs, *withInstr, *withFile); rc != 0 {
+		return rc
+	}
+	if (*withInstr != "" || *withFile != "") && *here {
+		fmt.Fprintln(os.Stderr, "error: --with/--with-file cannot be used with --here (no session is spawned to inject into)")
+		return 2
+	}
+	if *auto && *here {
+		fmt.Fprintln(os.Stderr, "error: --auto cannot be used with --here (--auto launches its own detached session)")
+		return 2
+	}
+	// --auto + --with/--with-file IS allowed: the instruction rides along to
+	// the detached run (e.g. a scheduled playbook that today should also
+	// double-check something). The delegation below forwards both flags.
 
 	dbPath, err := flowDBPath()
 	if err != nil {
@@ -56,6 +76,35 @@ func cmdRunPlaybook(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
+	}
+
+	// --here validation BEFORE the run-task row insert. Mirrors the
+	// pre-write checks in cmdDoHere — failing fast prevents a dangling
+	// backlog playbook_run task when env is wrong or this session is
+	// already owned by another task.
+	if *here {
+		h := defaultHarness()
+		sid := currentSessionID()
+		if sid == "" {
+			fmt.Fprintf(os.Stderr,
+				"error: --here requires running inside a Claude Code session ($%s is unset)\n",
+				h.SessionIDEnvVar())
+			return 1
+		}
+		if err := h.ValidateSessionID(sid); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"error: $%s is not a valid session id (%v)\n",
+				h.SessionIDEnvVar(), err)
+			return 1
+		}
+		priorBinding, lookupErr := flowdb.TaskBySessionID(db, sid)
+		if lookupErr == nil {
+			fmt.Fprintf(os.Stderr,
+				"error: this Claude session is already bound to task %q. binding it to a new playbook run would orphan %q's transcript and is rejected by the session_id uniqueness invariant.\n"+
+					"  to start this playbook run in a separate session: flow run playbook %s\n",
+				priorBinding.Slug, priorBinding.Slug, pb.Slug)
+			return 1
+		}
 	}
 
 	root, err := flowRoot()
@@ -76,6 +125,23 @@ func cmdRunPlaybook(args []string) int {
 		return 1
 	}
 
+	// Run task's work_dir. For the default (new-tab) path that's
+	// the playbook's work_dir — we spawn a tab there. For the
+	// --here path we adopt the binding session's cwd, because the
+	// run will execute in THIS session (wherever the user has it),
+	// and the cwd==work_dir invariant the bind path enforces means
+	// they must agree. If the user wants the run at the playbook's
+	// default path, they cd there first.
+	runWorkDir := pb.WorkDir
+	if *here {
+		wd, gerr := os.Getwd()
+		if gerr != nil {
+			fmt.Fprintf(os.Stderr, "error: read cwd: %v\n", gerr)
+			return 1
+		}
+		runWorkDir = wd
+	}
+
 	// Insert the run-task row.
 	now := flowdb.NowISO()
 	_, err = db.Exec(
@@ -85,7 +151,7 @@ func cmdRunPlaybook(args []string) int {
 		fmt.Sprintf("%s run %s", pb.Slug, runSlug),
 		pb.ProjectSlug,
 		pb.Slug,
-		pb.WorkDir,
+		runWorkDir,
 		now, now, now,
 	)
 	if err != nil {
@@ -104,13 +170,32 @@ func cmdRunPlaybook(args []string) int {
 		return 1
 	}
 
-	// Close our DB handle so cmdDo can re-open it (cmdDo opens its own).
+	// Close our DB handle so the delegate (cmdDo or cmdDoHere) can
+	// re-open its own connection.
 	db.Close()
 
-	// Delegate to cmdDo to spawn the session.
+	if *here {
+		// In-session bind path: no terminal spawn. dangerSkip is dropped
+		// — there's no claude process to forward the flag to. Run task
+		// was inserted with work_dir = os.Getwd() above so cmdDoHere's
+		// cwd-matches-work_dir invariant check passes without --force.
+		return cmdDoHere(runSlug, false)
+	}
+
+	// Default path: delegate to cmdDo to spawn the session in a new tab,
+	// or to launch a detached headless supervisor when --auto is set.
 	doArgs := []string{runSlug}
+	if *auto {
+		doArgs = append(doArgs, "--auto")
+	}
 	if *dangerSkip {
 		doArgs = append(doArgs, "--dangerously-skip-permissions")
+	}
+	if *withInstr != "" {
+		doArgs = append(doArgs, "--with", *withInstr)
+	}
+	if *withFile != "" {
+		doArgs = append(doArgs, "--with-file", *withFile)
 	}
 	return cmdDo(doArgs)
 }

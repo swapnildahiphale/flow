@@ -1,6 +1,18 @@
-# flow
+<p align="center">
+  <img src="assets/flow-logo.svg" alt="flow" width="480">
+</p>
 
-![Status](https://img.shields.io/badge/status-alpha-orange) ![License](https://img.shields.io/badge/license-MIT-blue.svg)
+<p align="center">
+  <a href="https://facets-cloud.github.io/flow/"><strong>Website</strong></a> ·
+  <a href="#install">Install</a> ·
+  <a href="#see-it-in-action">Demo</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status">
+  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License">
+</p>
 
 > A complete task manager for Claude Code — and the working memory
 > layer that turns every session from a brilliant new hire into the
@@ -187,11 +199,15 @@ handles the rest.
 ## What you get
 
 - **One task, one Claude session, one tab.** `flow do <task>`
-  spawns a dedicated tab in iTerm2, Warp, stock macOS Terminal, or
-  your current zellij session (requires zellij ≥ 0.40) — flow picks
+  spawns a dedicated tab in iTerm2, Warp, stock macOS Terminal, kitty
+  (requires `allow_remote_control yes` in `kitty.conf`), or your
+  current zellij session (requires zellij ≥ 0.40) — flow picks
   whichever you launched it from. Override with
-  `FLOW_TERM=warp|iterm|terminal|zellij` when you're on a non-standard
-  host. Tomorrow's `flow do <task>` resumes the same conversation.
+  `FLOW_TERM=warp|iterm|terminal|zellij|kitty` when you're on a
+  non-standard host — or set `FLOW_TERM=bg` to launch the session as a
+  **terminal-free Claude background agent** (Claude Code's Agent View,
+  `claude agents`) with no tab at all. Tomorrow's `flow do <task>`
+  resumes the same conversation either way.
 - **Interview-driven task capture.** No forms. flow asks
   what / why / where / done-when, then writes a structured brief.
 - **A knowledge base that grows.** Five markdown buckets for
@@ -209,8 +225,9 @@ handles the rest.
 ## How it works under the hood
 
 `flow do <task>` pre-allocates a session UUID, writes it to the
-task row, and spawns a tab in zellij (when `$ZELLIJ` is set), the
-backend named in `$FLOW_TERM` (when set), Warp / iTerm2 / stock
+task row, and spawns a tab in zellij (when `$ZELLIJ` is set), kitty
+(when `$KITTY_WINDOW_ID` is set or `$TERM=xterm-kitty`), the backend
+named in `$FLOW_TERM` (when set), or Warp / iTerm2 / stock
 Terminal.app (auto-detected from `$TERM_PROGRAM`) — chosen in that
 priority order, with iTerm as the historical fallback — running
 `claude --session-id <uuid>` with `FLOW_TASK` / `FLOW_PROJECT` inlined.
@@ -220,6 +237,11 @@ The jsonl file lands at the deterministic path
 conversation. A SessionStart hook re-injects the task brief,
 updates, and CLAUDE.md context on every resume; a UserPromptSubmit
 hook keeps the flow skill discoverable in ad-hoc Claude sessions.
+
+When `flow do <task>` is run for a task whose session is already
+live in another tab, flow focuses that tab instead of spawning a
+duplicate. The source tab prints "Already open: `<slug>` — switched
+to existing tab" as an audit line.
 
 The first `flow do` from stock Terminal.app needs macOS Accessibility
 permission for the **app hosting your shell** — not the `flow` binary
@@ -232,6 +254,84 @@ toggle for "Terminal" if you launched flow from Terminal.app, "iTerm"
 from iTerm2, "Claude" if Claude Code is the host, etc.; add it via the
 + button if it's not listed). After the grant the spawn is silent.
 iTerm2 doesn't need this — it has a native `create tab` verb.
+
+### Background agents (`FLOW_TERM=bg`)
+
+If you live in Claude Code's **Agent View** (`claude agents`), set
+`FLOW_TERM=bg` and `flow do <task>` spawns the session as a
+terminal-free background agent instead of opening a tab. flow runs
+`claude --bg --name "<project>/<task>" <prompt>`, reads the short id
+from the launch banner, and resolves the real, full session id with a
+single `claude agents --json --all` lookup — then records *that* id on
+the task. (Background-capable harnesses manage their own session id, so
+flow captures the real one after launch rather than pre-allocating it.)
+
+Re-running `flow do <task>` is idempotent. If the session is still
+**live** in the Agent View (its process is up — running or idle-waiting),
+flow doesn't spawn or resume anything; it just tells you it's open, since
+you continue it from the Agent View (`claude agents`). If the session is
+**not running** (stopped, failed, or finished) or has been removed
+entirely, flow brings the conversation back as a background agent:
+`claude --bg --resume <id>` starts a fresh process seeded from the saved
+transcript. Because `--bg` manages its own id it does **not** preserve
+`--resume`'s id (plain `claude --resume` would keep the id but wouldn't be
+a background agent, so it can't be used here) — so flow captures and
+re-records the new id, carrying the prior conversation forward while never
+leaving the task pointed at a dead session. `flow show` and `flow list`
+surface each bg task's live status (busy / idle, working / blocked / done,
+pid) from a `claude agents --json --all` query, and `flow transcript
+<task>` finds the jsonl by globbing the session id (so it resolves even
+when a bg session relocates into a git worktree). The bg session is
+launched in the task's `work_dir`. Background mode is Claude-only today —
+pointing `FLOW_TERM=bg` at a task pinned to another harness fails with a
+clear error rather than silently falling back to a tab.
+
+### One-shot instructions with `--with`
+
+`flow do <task> --with "<instruction>"` resumes (or starts) the task's
+session and injects the instruction as the first user message —
+prefixed with `[via flow do --with]` so the model can tell injected
+input from typed input.
+
+`--with-file <path>` is the same idea for longer instructions: instead
+of embedding the file contents, flow injects `read instructions at
+<absolute path>` and the session uses its Read tool to load the file.
+No size limits. The flags are mutually exclusive, and cannot be
+combined with `--here` (there's no spawned session to inject into).
+
+```bash
+# Nudge a parked task without opening the tab.
+flow do auth --with "check if upstream PR merged and update the brief if so"
+
+# --with on a done task auto-rolls it back to in-progress, so playbooks
+# can fire on previously-closed work.
+flow do auth --with "are we still blocked on the security review?"
+
+# Hand the session a longer brief to follow.
+flow do auth --with-file ~/playbooks/triage-checklist.md
+```
+
+This is the lane scheduled playbooks use to fire instructions at
+existing tasks without manual intervention. `flow run playbook <slug>`
+accepts the same flags for ad-hoc per-run instructions.
+
+### `flow stats`
+
+Show usage & ROI analytics derived from your own flow history — how many
+times flow recalled stored context for you, tokens processed, tasks done,
+automation runs, and estimated time/$ saved.
+
+    flow stats                      # all-time terminal report
+    flow stats --since 30d          # last 30 days
+    flow stats --project <slug>     # scope to one project
+    flow stats --card               # write a shareable HTML card to ~/.flow/stats-card.html
+    flow stats --card --out card.html   # ...or to a path you choose
+
+Savings figures are estimates driven by `~/.flow/stats.json` — optional;
+built-in defaults apply when it's absent, so create it only to override
+them. Ground-truth counts are exact. `~/.flow/stats-cache.json` is a
+derived cache — safe to delete, and should be gitignored if you track
+`~/.flow` in git.
 
 ## Your data — local, portable, yours
 
@@ -296,22 +396,16 @@ and reinstall the skill + hook.
 
 ## Where flow runs (and where we'd love help)
 
-Today flow runs on **macOS (iTerm2, Warp, stock Terminal.app, or
-zellij) + Claude Code only**. That's the stack we use, and that's
-what the session-spawn layer was built and tested against. zellij
-works on Linux too as a side effect — it's cross-platform and flow's
-zellij backend doesn't depend on any macOS APIs.
-
-The Warp backend has a small but real caveat: Warp v0.2026.04
-introduced an input-filter that drops synthetic Return key events
-(`key code 36`, `keystroke return`) for ~2s after typed input, so
-flow submits via `keystroke (ASCII character 13)` instead and adds
-focus + settle delays totalling ~1.1s warm / ~2.3s cold. If your
-zsh / bash startup is slow (oh-my-zsh + lots of plugins, heavy
-`nvm`/`pyenv` initialisers), the spawn may type into a not-yet-ready
-prompt. Keeping interactive-shell startup under ~500ms is the
-healthy threshold. The first `flow do` from Warp will prompt for
-macOS Accessibility for "Warp" — granting once is enough.
+Today flow runs on **macOS (iTerm2, Warp, stock Terminal.app, kitty,
+zellij, or Claude Code background agents via `FLOW_TERM=bg`) + Claude
+Code only**. That's the stack we use, and that's what the session-spawn
+layer was built and tested against. The background-agent backend is
+platform-agnostic (no terminal, no AppleScript) but Claude-only. zellij
+and kitty work on Linux too as a side effect — both are
+cross-platform and flow's zellij / kitty backends don't depend on
+any macOS APIs. Kitty needs `allow_remote_control yes` (or
+`socket-only`) in `kitty.conf` so flow can drive `kitty @ launch`
+from inside the running kitty instance.
 
 The architecture is portable — session spawning is one small
 package — but other harnesses (Codex, Cursor, plain shell) and other

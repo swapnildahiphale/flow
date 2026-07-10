@@ -3,13 +3,59 @@ package app
 import (
 	"database/sql"
 	"errors"
+	"flag"
 	"flow/internal/flowdb"
+	"flow/internal/harness"
 	"flow/internal/spawner"
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 )
+
+// loadInjectionText resolves --with / --with-file into the text that
+// will be injected as the session's first user message. For
+// --with-file we don't embed the file's contents — we synthesize a
+// "read instructions at <abs-path>" prompt and let the session use its
+// Read tool. That keeps the shell-quoted blob short regardless of file
+// size and lets the receiving model reason about the file directly.
+func loadInjectionText(fs *flag.FlagSet, withInstr, withFile string) (string, int) {
+	passedWith, passedWithFile := false, false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "with":
+			passedWith = true
+		case "with-file":
+			passedWithFile = true
+		}
+	})
+	if !passedWith && !passedWithFile {
+		return "", 0
+	}
+	if passedWith && passedWithFile {
+		fmt.Fprintln(os.Stderr, "error: --with and --with-file are mutually exclusive")
+		return "", 2
+	}
+	if passedWith {
+		text := strings.TrimSpace(withInstr)
+		if text == "" {
+			fmt.Fprintln(os.Stderr, "error: --with instruction is empty")
+			return "", 2
+		}
+		return text, 0
+	}
+	if _, err := os.Stat(withFile); err != nil {
+		fmt.Fprintf(os.Stderr, "error: --with-file: %v\n", err)
+		return "", 1
+	}
+	abs, err := filepath.Abs(withFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: --with-file: %v\n", err)
+		return "", 1
+	}
+	return "read instructions at " + abs, 0
+}
 
 // openConcurrentDB opens flow.db with a generous busy_timeout so that two
 // concurrent `flow do` processes (or two goroutines in the tests) will
@@ -54,9 +100,12 @@ func cmdDo(args []string) int {
 	}
 	fs := flagSet("do")
 	fresh := fs.Bool("fresh", false, "discard existing session and re-bootstrap")
-	dangerSkip := fs.Bool("dangerously-skip-permissions", false, "pass --dangerously-skip-permissions through to claude")
+	dangerSkip := fs.Bool("dangerously-skip-permissions", false, "skip per-tool approval prompts in the spawned harness")
 	force := fs.Bool("force", false, "open even if the task's Claude session is already running elsewhere")
 	here := fs.Bool("here", false, "bind THIS Claude session to the task (no new tab); requires running inside a Claude Code session")
+	auto := fs.Bool("auto", false, "run headlessly in the background (no tab, no human); the session self-completes via `flow done`. Implies --dangerously-skip-permissions")
+	withInstr := fs.String("with", "", "inject `<instruction>` as the first user message after the bootstrap/resume")
+	withFile := fs.String("with-file", "", "inject 'read instructions at <path>' (mutually exclusive with --with)")
 	// Two-pass parse so the slug positional may appear before OR after
 	// the flags: first absorb any leading flags, then take the next
 	// non-flag as the slug, then absorb any trailing flags.
@@ -72,13 +121,31 @@ func cmdDo(args []string) int {
 		return 2
 	}
 
-	if *here {
-		return cmdDoHere(query, *force)
+	injectionText, rc := loadInjectionText(fs, *withInstr, *withFile)
+	if rc != 0 {
+		return rc
+	}
+	if injectionText != "" && *here {
+		fmt.Fprintln(os.Stderr, "error: --with/--with-file cannot be used with --here (no session is spawned to inject into)")
+		return 2
 	}
 
-	var extraClaudeArgs []string
-	if *dangerSkip {
-		extraClaudeArgs = append(extraClaudeArgs, "--dangerously-skip-permissions")
+	if *auto && *here {
+		fmt.Fprintln(os.Stderr, "error: --auto cannot be used with --here (--auto launches its own detached session; --here binds the current one)")
+		return 2
+	}
+	// --auto + --with IS allowed: the instruction is forwarded to the
+	// detached supervisor and appended (behind withMarker) to the
+	// autonomous prompt — useful for one-off directives on a scheduled
+	// playbook run or an unattended task.
+	// --auto runs headlessly with no human to approve tool calls, so it
+	// implies --dangerously-skip-permissions.
+	if *auto {
+		*dangerSkip = true
+	}
+
+	if *here {
+		return cmdDoHere(query, *force)
 	}
 
 	dbPath, err := flowDBPath()
@@ -100,16 +167,80 @@ func cmdDo(args []string) int {
 
 	// Live-session guard: if this task's session_id is already running
 	// in another claude process (e.g., the user has a tab open for it),
-	// refuse to spawn a duplicate. --force overrides. The check is
+	// try to focus that tab. If the focus succeeds, exit 0 — the user
+	// gets switched to the existing tab. If the focus path can't find
+	// the tab (different terminal app, different zellij session, etc.)
+	// or itself errors, fall back to refusing the spawn so the user
+	// knows to switch manually or pass --force. The ps check is
 	// best-effort: ps failures fall through silently rather than block.
-	if !*force && task.SessionID.Valid && task.SessionID.String != "" {
-		if live, err := liveClaudeSessions(); err == nil {
-			if live[strings.ToLower(task.SessionID.String)] {
+	//
+	// Duplicate detection: if more than one claude process is running
+	// the same session UUID (possible via prior --force, or a manual
+	// `claude --resume <uuid>` in another tab), warn before focusing.
+	// Both processes write to the same session jsonl and can race —
+	// the user almost certainly wants to know.
+	// Pick the harness for this spawn. If the task has been opened
+	// before, task.harness is set and binding; otherwise detect from
+	// the current process's ambient harness env (so `flow do` from
+	// inside codex picks codex), falling back to claude.
+	h, err := harnessForSpawn(task)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	// Background-agent mode ($FLOW_TERM=bg): spawn a terminal-free
+	// background session via the harness's BackgroundLauncher instead of
+	// opening a tab. Checked BEFORE the spawn machinery (parallel to the
+	// --auto branch). bg can't combine with --auto (different spawn
+	// shapes) or --here (binds the current session, no spawn).
+	if spawner.IsBackground() {
+		if *auto {
+			fmt.Fprintln(os.Stderr, "error: $FLOW_TERM=bg cannot be combined with --auto (both spawn their own session; pick one)")
+			return 2
+		}
+		return cmdDoBackground(db, task, h, *fresh, *dangerSkip, injectionText)
+	}
+
+	// The focus-an-existing-tab behavior only makes sense for the
+	// interactive path. For --auto there is no tab to focus; the
+	// equivalent "already in flight" guard is the auto_run_status check
+	// below, so skip this block entirely when *auto.
+	if !*force && !*auto && task.SessionID.Valid && task.SessionID.String != "" {
+		if live, err := h.LiveSessionIDs(); err == nil {
+			if n := live[strings.ToLower(task.SessionID.String)]; n > 0 {
+				if n > 1 {
+					fmt.Fprintf(os.Stderr,
+						"warning: %d %s processes are running session %s — both write to the same transcript and may race; close duplicates if unintended\n",
+						n, h.Binary(), task.SessionID.String)
+				}
+				focused, ferr := spawner.FocusSession(task.SessionID.String, h.Binary())
+				if focused {
+					fmt.Printf("Already open: %s — switched to existing tab\n", task.Slug)
+					return 0
+				}
+				if ferr != nil {
+					fmt.Fprintf(os.Stderr, "warning: focus attempt failed: %v\n", ferr)
+				}
 				fmt.Fprintf(os.Stderr,
-					"error: task %q has a live Claude session (%s) running elsewhere — switch to that tab, or pass --force to open another\n",
-					task.Slug, task.SessionID.String)
+					"error: task %q has a live %s session (%s) running elsewhere — switch to that tab, or pass --force to open another\n",
+					task.Slug, h.Binary(), task.SessionID.String)
 				return 1
 			}
+		}
+	}
+
+	// Auto "already in flight" guard: refuse a second --auto launch while a
+	// prior autonomous run is still running (reconciling a dead supervisor
+	// to 'dead' first). --force overrides — it abandons tracking of the
+	// prior run and launches a fresh supervisor.
+	if *auto && !*force {
+		reconcileAutoRun(db, task)
+		if task.AutoRunStatus.Valid && task.AutoRunStatus.String == "running" {
+			fmt.Fprintf(os.Stderr,
+				"error: task %q already has an autonomous run in progress (pid %d) — wait for it to finish, or pass --force to launch another\n",
+				task.Slug, task.AutoRunPID.Int64)
+			return 1
 		}
 	}
 
@@ -137,10 +268,13 @@ func cmdDo(args []string) int {
 		return 1
 	}
 	if curStatus == "done" {
-		fmt.Fprintf(os.Stderr,
-			"error: task %q is done; edit its status back to backlog or in-progress to reopen it\n",
-			task.Slug)
-		return 1
+		if injectionText == "" {
+			fmt.Fprintf(os.Stderr,
+				"error: task %q is done; edit its status back to backlog or in-progress to reopen it\n",
+				task.Slug)
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "--with on done task %q: reopening as in-progress\n", task.Slug)
 	}
 
 	// Decide bootstrap vs resume based on the row we re-read inside the tx.
@@ -156,7 +290,7 @@ func cmdDo(args []string) int {
 	needsBootstrap := !curSessionID.Valid || *fresh
 	var sessionID string
 	if needsBootstrap {
-		id, err := newUUID()
+		id, err := h.NewSessionID()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: allocate session id: %v\n", err)
 			return 1
@@ -167,13 +301,35 @@ func cmdDo(args []string) int {
 	}
 
 	now := flowdb.NowISO()
+	// 'done' is reachable here only via the --with auto-reopen path above.
+	const statusFilter = "status IN ('backlog','in-progress','done')"
 	if needsBootstrap {
+		// Persist the harness name alongside session_id so future
+		// `flow do` invocations read the same adapter — even if
+		// they're issued from a different ambient harness or no
+		// harness at all.
+		//
+		// COALESCE on the harness column: write only when currently
+		// NULL/empty. The column is "set once on first bind"
+		// (per the doc comment in flowdb/db.go) — the bootstrap
+		// path should never silently overwrite a pre-existing pin.
+		// `flow do --here --force` is the explicit lane for harness
+		// switches and writes the column unconditionally there.
+		//
+		// Note on cwd: bootstrap spawns the new tab with
+		// cwd=task.WorkDir, so the harness writes its transcript
+		// under that encoded path. The "session_id is bound to
+		// work_dir" invariant holds by construction here — no
+		// extra column needed; future resumes spawn at work_dir
+		// and the transcript will be found.
 		if _, err := tx.Exec(
 			`UPDATE tasks SET status='in-progress',
 			 status_changed_at = CASE WHEN status != 'in-progress' THEN ? ELSE status_changed_at END,
-			 session_id=?, session_started=?, updated_at=?
-			 WHERE slug=? AND status IN ('backlog','in-progress')`,
-			now, sessionID, now, now, task.Slug,
+			 session_id=?, session_started=?,
+			 harness = CASE WHEN harness IS NULL OR harness = '' THEN ? ELSE harness END,
+			 updated_at=?
+			 WHERE slug=? AND `+statusFilter,
+			now, sessionID, now, string(h.Name()), now, task.Slug,
 		); err != nil {
 			fmt.Fprintf(os.Stderr, "error: flip status: %v\n", err)
 			return 1
@@ -183,7 +339,7 @@ func cmdDo(args []string) int {
 			`UPDATE tasks SET status='in-progress',
 			 status_changed_at = CASE WHEN status != 'in-progress' THEN ? ELSE status_changed_at END,
 			 updated_at=?
-			 WHERE slug=? AND status IN ('backlog','in-progress')`,
+			 WHERE slug=? AND `+statusFilter,
 			now, now, task.Slug,
 		); err != nil {
 			fmt.Fprintf(os.Stderr, "error: flip status: %v\n", err)
@@ -208,6 +364,49 @@ func cmdDo(args []string) int {
 		fmt.Printf("--fresh: discarding old session %s\n", curSessionID.String)
 	}
 
+	// --auto: instead of spawning an interactive tab, launch a detached
+	// headless supervisor that runs claude to completion in the
+	// background. The status flip above already committed (in-progress +
+	// session_id), so we only need to start the supervisor and record the
+	// run bookkeeping.
+	if *auto {
+		root, err := flowRoot()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 1
+		}
+		if task.WorkDir == "" {
+			fmt.Fprintf(os.Stderr, "error: task %q has no work_dir\n", task.Slug)
+			return 1
+		}
+		pid, logPath, err := launchAutoRun(task, root, injectionText)
+		if err != nil {
+			// Launch failed before claude could write its jsonl. Mirror the
+			// spawn-failure recovery: undo a fresh bootstrap's pre-allocated
+			// session + status flip so the next attempt retries cleanly.
+			if needsBootstrap {
+				if _, undoErr := db.Exec(
+					`UPDATE tasks SET session_id=NULL, session_started=NULL,
+						status='backlog', status_changed_at=NULL, updated_at=?
+					 WHERE slug=? AND session_id=?`,
+					flowdb.NowISO(), task.Slug, sessionID,
+				); undoErr != nil {
+					fmt.Fprintf(os.Stderr, "warning: rollback after auto-launch failure: %v\n", undoErr)
+				}
+			}
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 1
+		}
+		if err := recordAutoRunLaunched(db, task.Slug, pid, logPath); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: record auto run: %v\n", err)
+		}
+		if _, err := db.Exec(`UPDATE workdirs SET last_used_at = ? WHERE path = ?`, flowdb.NowISO(), task.WorkDir); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: bump workdir last_used_at: %v\n", err)
+		}
+		fmt.Printf("Launched autonomous run for %s (pid %d)\n  log: %s\n", task.Slug, pid, logPath)
+		return 0
+	}
+
 	// Look up project (may be nil).
 	var project *flowdb.Project
 	if task.ProjectSlug.Valid {
@@ -225,19 +424,24 @@ func cmdDo(args []string) int {
 		return 1
 	}
 
-	// Spawn the iTerm tab.
+	// Spawn the tab via the active harness adapter.
 	//
-	// We shell out to `claude` directly (no wrapper). The skill on disk at
-	// ~/.claude/skills/flow/SKILL.md is whatever was last installed via
+	// The skill on disk (e.g. ~/.claude/skills/flow/SKILL.md for the
+	// claude harness) is whatever was last installed via
 	// `flow skill install` / `flow skill update`. To refresh it after
 	// upgrading flow, the user runs `flow skill update` manually.
 	var command string
+	launchOpts := harness.LaunchOpts{
+		SkipPermissions: *dangerSkip,
+		Inject:          injectionText,
+	}
 	if needsBootstrap {
-		// Fresh bootstrap path: we pre-allocated the session UUID above
-		// and committed it to the DB. Passing --session-id to claude
-		// makes it write its jsonl at the deterministic path
-		// ~/.claude/projects/<encoded-cwd>/<sessionID>.jsonl, so there is
-		// nothing to discover afterwards.
+		// Fresh bootstrap path. For pre-allocating harnesses (claude),
+		// PrepareSpawn already minted the sessionID and the status flip
+		// above committed it, so the harness can embed it in the spawn
+		// command (e.g. `--session-id <uuid>`) for deterministic
+		// transcript paths. For self-allocating harnesses sessionID will
+		// be empty — the SessionStart hook completes the binding later.
 		playbookSlug := ""
 		isFirstRun := false
 		if task.PlaybookSlug.Valid {
@@ -255,20 +459,17 @@ func cmdDo(args []string) int {
 			isFirstRun = runCount <= 1
 		}
 		prompt := buildBootstrapPromptForKindV2(task.Slug, task.Kind, playbookSlug, isFirstRun)
-		command = fmt.Sprintf("claude --session-id %s %s", sessionID, spawner.ShellQuote(prompt))
+		command = h.LaunchCmd(sessionID, prompt, launchOpts)
 	} else {
-		// Resume path: the UUID we already have in the DB is what claude
-		// used to write its existing jsonl.
-		command = "claude --resume " + sessionID
+		// Resume path: the UUID we already have in the DB is what the
+		// harness used when it first wrote its transcript.
+		command = h.ResumeCmd(sessionID, launchOpts)
 	}
-	if *dangerSkip {
-		command += " --dangerously-skip-permissions"
-	}
-	// The spawned session learns its task via reverse-lookup on
-	// $CLAUDE_CODE_SESSION_ID against tasks.session_id — the DB is the
-	// single source of truth, so no FLOW_TASK / FLOW_PROJECT injection.
-	// We DO propagate $FLOW_ROOT when set, so the spawned session reads
-	// the same flow.db / kb / briefs the parent process is using.
+	// Env propagation. Flow never injects harness-specific env vars
+	// (the harness exports its own session id env; flow only reads
+	// it). The one exception is $FLOW_ROOT — flow's own data root —
+	// which the spawned session needs to read the same flow.db / kb
+	// / briefs as the parent process.
 	var spawnEnv map[string]string
 	if root := os.Getenv("FLOW_ROOT"); root != "" {
 		spawnEnv = map[string]string{"FLOW_ROOT": root}
@@ -327,6 +528,198 @@ func cmdDo(args []string) int {
 		fmt.Printf("Resumed %s (session %s)\n", task.Slug, sessionID)
 	}
 	return 0
+}
+
+// backgroundLauncherFor returns the harness's BackgroundLauncher
+// capability, or a clean error if the harness can't host background
+// sessions. This is the capability gate for $FLOW_TERM=bg: flow never
+// silently falls back to a terminal tab when the pinned harness lacks
+// the capability.
+func backgroundLauncherFor(h harness.Harness) (harness.BackgroundLauncher, error) {
+	bg, ok := h.(harness.BackgroundLauncher)
+	if !ok {
+		return nil, fmt.Errorf(
+			"$FLOW_TERM=bg requested a background agent, but harness %q has no background-session support (only claude does today) — unset FLOW_TERM to open a terminal tab instead",
+			h.Name())
+	}
+	return bg, nil
+}
+
+// bgAgentInRegistry returns the registry entry for sessionID (any state:
+// working / blocked / idle / done / failed / stopped), or nil if the
+// session is absent (removed / no longer tracked) or the registry query
+// fails. "Present" means the Agent View still knows it — recoverable by
+// attaching; "absent" means it must be brought back via a resume.
+func bgAgentInRegistry(bg harness.BackgroundLauncher, sessionID string) *harness.BackgroundAgent {
+	agents, err := bg.BackgroundAgents()
+	if err != nil {
+		return nil
+	}
+	for i := range agents {
+		if strings.EqualFold(agents[i].SessionID, sessionID) {
+			return &agents[i]
+		}
+	}
+	return nil
+}
+
+// bgStateLabel renders a background agent's coarse condition for user
+// messages, e.g. "busy/working" while live or just "stopped" once exited.
+func bgStateLabel(a *harness.BackgroundAgent) string {
+	switch {
+	case a.Status != "" && a.State != "":
+		return a.Status + "/" + a.State
+	case a.State != "":
+		return a.State
+	case a.Status != "":
+		return a.Status
+	default:
+		return "unknown"
+	}
+}
+
+// cmdDoBackground is the $FLOW_TERM=bg branch of `flow do`. It spawns (or
+// resumes) a terminal-free background agent via the harness's
+// BackgroundLauncher and captures the harness-minted session id. Unlike
+// the interactive path, the session id is NOT pre-allocated — a
+// backgrounding harness manages its own id, so flow records the REAL id
+// returned after spawn (fixing the phantom-id leak the user's `--bg`
+// alias caused).
+//
+// Resume/already-running protocol:
+//   - no session yet (or --fresh) → spawn fresh + capture id
+//   - session bound AND alive in the registry → report, don't double-spawn
+//   - session bound but gone → resume by id (transcript preserved)
+func cmdDoBackground(db *sql.DB, task *flowdb.Task, h harness.Harness, fresh, skipPerms bool, inject string) int {
+	bg, err := backgroundLauncherFor(h)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	if task.WorkDir == "" {
+		fmt.Fprintf(os.Stderr, "error: task %q has no work_dir\n", task.Slug)
+		return 1
+	}
+	if task.Status == "done" {
+		fmt.Fprintf(os.Stderr,
+			"error: task %q is done; reopen it (flow update task %s --status in-progress) before running it in the background\n",
+			task.Slug, task.Slug)
+		return 1
+	}
+
+	// Project lookup is only for the display title (same as the tab path).
+	var project *flowdb.Project
+	if task.ProjectSlug.Valid {
+		p, perr := flowdb.GetProject(db, task.ProjectSlug.String)
+		if perr != nil && !errors.Is(perr, sql.ErrNoRows) {
+			fmt.Fprintf(os.Stderr, "error: get project: %v\n", perr)
+			return 1
+		}
+		project = p
+	}
+	title := buildTabTitle(project, task)
+	opts := harness.LaunchOpts{SkipPermissions: skipPerms, Inject: inject}
+
+	hasSession := task.SessionID.Valid && task.SessionID.String != ""
+
+	if hasSession && !fresh {
+		sid := task.SessionID.String
+		// If the session is still LIVE in the Agent View (process alive —
+		// running or idle-waiting), don't spawn or resume: it's already
+		// there, so just point the user at it. (A live bg session keeps a
+		// pid; an exited one — stopped/failed/done — has none.)
+		if a := bgAgentInRegistry(bg, sid); a != nil && a.PID > 0 {
+			fmt.Printf("%s is open in your Agent View (%s, %s) — run `claude agents` to view or reply\n",
+				task.Slug, a.ShortID, bgStateLabel(a))
+			return 0
+		}
+
+		// Not running (exited: stopped/failed/done) or removed: bring the
+		// conversation back as a background agent seeded from its
+		// transcript. `claude --bg --resume` mints a NEW id (history
+		// inherited — it can't keep the id under --bg), so capture and
+		// re-record it; otherwise flow would keep pointing at the dead id
+		// (the phantom-id bug). Plain `--resume` would preserve the id but
+		// wouldn't be a background agent, so it can't be used in bg mode.
+		agent, err := bg.ResumeBackground(task.WorkDir, sid, opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			return 1
+		}
+		now := flowdb.NowISO()
+		if _, err := db.Exec(
+			`UPDATE tasks SET status='in-progress',
+			 status_changed_at = CASE WHEN status != 'in-progress' THEN ? ELSE status_changed_at END,
+			 session_id=?, session_started=COALESCE(session_started, ?), session_last_resumed=?, updated_at=?
+			 WHERE slug=?`,
+			now, agent.SessionID, now, now, now, task.Slug,
+		); err != nil {
+			fmt.Fprintf(os.Stderr, "error: record resume: %v\n", err)
+			return 1
+		}
+		bumpWorkdirUsed(db, task.WorkDir)
+		fmt.Printf("Resumed %s in background (prior session was no longer tracked; brought the conversation back as %s · session %s)\n  check your Agent View: `claude agents`\n",
+			task.Slug, agent.ShortID, agent.SessionID)
+		return 0
+	}
+
+	// Fresh spawn (no session, or --fresh discards the old one).
+	if fresh && hasSession {
+		fmt.Printf("--fresh: discarding old session %s\n", task.SessionID.String)
+	}
+	playbookSlug, isFirstRun := bgPlaybookContext(db, task)
+	prompt := buildBootstrapPromptForKindV2(task.Slug, task.Kind, playbookSlug, isFirstRun)
+
+	agent, err := bg.SpawnBackground(task.WorkDir, title, prompt, opts)
+	if err != nil {
+		// Nothing was written to the DB yet — clean failure, next attempt retries.
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	now := flowdb.NowISO()
+	// Record the harness-minted REAL session id alongside status + harness.
+	// COALESCE on harness mirrors the interactive bootstrap: set-once.
+	if _, err := db.Exec(
+		`UPDATE tasks SET status='in-progress',
+		 status_changed_at = CASE WHEN status != 'in-progress' THEN ? ELSE status_changed_at END,
+		 session_id=?, session_started=?,
+		 harness = CASE WHEN harness IS NULL OR harness = '' THEN ? ELSE harness END,
+		 updated_at=? WHERE slug=?`,
+		now, agent.SessionID, now, string(h.Name()), now, task.Slug,
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "error: record session: %v\n", err)
+		return 1
+	}
+	bumpWorkdirUsed(db, task.WorkDir)
+	fmt.Printf("Spawned %s in background (session %s) — %s · %s\n  check your Agent View: `claude agents`\n",
+		task.Slug, agent.SessionID, agent.ShortID, title)
+	return 0
+}
+
+// bgPlaybookContext computes (playbookSlug, isFirstRun) for a task's
+// bootstrap prompt, mirroring the interactive bootstrap path. Returns
+// ("", false) for regular tasks.
+func bgPlaybookContext(db *sql.DB, task *flowdb.Task) (string, bool) {
+	if !task.PlaybookSlug.Valid {
+		return "", false
+	}
+	playbookSlug := task.PlaybookSlug.String
+	var runCount int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM tasks WHERE playbook_slug = ? AND kind = 'playbook_run' AND archived_at IS NULL`,
+		playbookSlug,
+	).Scan(&runCount); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: count playbook runs: %v\n", err)
+	}
+	return playbookSlug, runCount <= 1
+}
+
+// bumpWorkdirUsed updates workdirs.last_used_at, best-effort.
+func bumpWorkdirUsed(db *sql.DB, path string) {
+	if _, err := db.Exec(`UPDATE workdirs SET last_used_at = ? WHERE path = ?`, flowdb.NowISO(), path); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: bump workdir last_used_at: %v\n", err)
+	}
 }
 
 // buildBootstrapPromptForKind dispatches to the right prompt variant
@@ -475,15 +868,25 @@ func findTask(db *sql.DB, query string) (*flowdb.Task, int) {
 // var injection. Subsequent `flow do <slug>` from elsewhere will
 // resume this session via `claude --resume`.
 func cmdDoHere(query string, force bool) int {
-	sid := currentSessionID()
-	if sid == "" {
-		fmt.Fprintln(os.Stderr,
-			"error: --here requires running inside a Claude Code session ($CLAUDE_CODE_SESSION_ID is unset)")
+	// --here only makes sense from inside a harness session. Probe
+	// ambient explicitly — defaultHarness's claude fallback would
+	// mask the "user isn't in any harness" case.
+	h := ambientHarness()
+	if h == nil {
+		var probed []string
+		for _, hh := range allHarnesses() {
+			probed = append(probed, "$"+hh.SessionIDEnvVar())
+		}
+		fmt.Fprintf(os.Stderr,
+			"error: --here requires running inside a known harness session; none of %s is set\n",
+			strings.Join(probed, ", "))
 		return 1
 	}
-	if !sessionUUIDRe.MatchString(sid) {
+	sid := os.Getenv(h.SessionIDEnvVar())
+	if err := h.ValidateSessionID(sid); err != nil {
 		fmt.Fprintf(os.Stderr,
-			"error: $CLAUDE_CODE_SESSION_ID is not a valid v4 UUID (got %q)\n", sid)
+			"error: $%s is not a valid session id (%v)\n",
+			h.SessionIDEnvVar(), err)
 		return 1
 	}
 
@@ -509,6 +912,25 @@ func cmdDoHere(query string, force bool) int {
 			"error: task %q is done; reopen it first via `flow update task %s --status in-progress` (after which --here is unnecessary — the prior session_id is preserved)\n",
 			task.Slug, task.Slug)
 		return 1
+	}
+
+	// If the task has a harness pinned and it differs from the
+	// session this --here would attach, --force is required to
+	// switch. The switch is destructive in the soft sense — the
+	// prior harness's transcript file stays on disk but flow no
+	// longer tracks it (close-out sweep, transcript renderer, and
+	// resume path all now point at the new harness). Without
+	// --force we refuse so the user makes the swap deliberately.
+	if task.Harness.Valid && task.Harness.String != "" && task.Harness.String != string(h.Name()) {
+		if !force {
+			fmt.Fprintf(os.Stderr,
+				"error: task %q is pinned to harness %q but this session is %q — pass --force to switch harnesses (the prior harness's transcript history will no longer be tracked by flow)\n",
+				task.Slug, task.Harness.String, h.Name())
+			return 1
+		}
+		fmt.Fprintf(os.Stderr,
+			"warning: --force switching task %q from harness %q to %q; prior transcript is orphaned from flow's view\n",
+			task.Slug, task.Harness.String, h.Name())
 	}
 
 	// Check 1: is THIS session already bound to a different task? Binding
@@ -541,16 +963,46 @@ func cmdDoHere(query string, force bool) int {
 		}
 	}
 
+	// Invariant validation. Any task with session_id has work_dir
+	// == the cwd that session was created at — because the
+	// harness's on-disk transcript path is keyed by (cwd, sid),
+	// and future `flow do <slug>` resumes spawn at work_dir
+	// (GH #59).
+	//
+	// h.ValidateSession is the honest check: claude's impl stats
+	// the expected jsonl path on disk. Comparing os.Getwd() to
+	// work_dir would be fooled by chained-cd from inside a claude
+	// Bash invocation (the subprocess cwd has nothing to do with
+	// where the actual jsonl was written). Codex's impl will
+	// no-op since its sessions are sid-only.
+	if err := h.ValidateSession(task.WorkDir, sid); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"error: can't bind this session to task %q — the claude transcript isn't where work_dir says it should be:\n"+
+				"  %v\n"+
+				"this means claude was started in a different directory than task.work_dir, OR work_dir is set wrong.\n"+
+				"pick one of:\n"+
+				"  - open it in a new tab (recommended):           flow do %s\n"+
+				"  - point work_dir at where claude actually runs: flow update task %s --work-dir <real-cwd>\n"+
+				"    (allowed because the new work_dir must match the session's real on-disk location)\n",
+			task.Slug, err, task.Slug, task.Slug)
+		return 1
+	}
+
 	now := flowdb.NowISO()
+	// Also writes harness — for a previously-unpinned task this
+	// is the first bind; for a same-harness --here it's a no-op
+	// write; for a --force harness switch it persists the swap
+	// alongside the new session_id.
 	res, err := db.Exec(
 		`UPDATE tasks SET
 			session_id      = ?,
 			session_started = COALESCE(session_started, ?),
 			status          = 'in-progress',
 			status_changed_at = CASE WHEN status != 'in-progress' THEN ? ELSE status_changed_at END,
+			harness         = ?,
 			updated_at      = ?
 		WHERE slug = ?`,
-		sid, now, now, now, task.Slug,
+		sid, now, now, string(h.Name()), now, task.Slug,
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: bind session: %v\n", err)

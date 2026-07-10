@@ -15,12 +15,14 @@ func flagSet(name string) *flag.FlagSet {
 	return fs
 }
 
-// currentSessionID returns this process's Claude Code session UUID,
-// or "" if not running inside a Claude Code session. Reads
-// $CLAUDE_CODE_SESSION_ID, which Claude Code injects into every
-// session's environment.
+// currentSessionID returns this process's harness session id, or ""
+// if not running inside any known harness. Probes every implemented
+// harness's session-id env var and returns the one that's set.
 func currentSessionID() string {
-	return os.Getenv("CLAUDE_CODE_SESSION_ID")
+	if h := ambientHarness(); h != nil {
+		return os.Getenv(h.SessionIDEnvVar())
+	}
+	return ""
 }
 
 // currentSessionTask returns the task bound to this Claude session

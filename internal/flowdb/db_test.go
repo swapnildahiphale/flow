@@ -3,6 +3,7 @@ package flowdb
 import (
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -60,6 +61,36 @@ func TestOpenDBIdempotent(t *testing.T) {
 		t.Fatalf("second open: %v", err)
 	}
 	db2.Close()
+}
+
+// TestOpenDBConcurrentDoesNotBusy pins that two parallel OpenDB calls
+// on the same path don't race during schema setup. Without busy_timeout
+// applied at open time, the loser hits SQLITE_BUSY on `pragma
+// table_info(tasks)` during runMigrations on slow runners — observed
+// as a flaky CI failure on the app-level concurrent-do test.
+func TestOpenDBConcurrentDoesNotBusy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flow.db")
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := range n {
+		go func() {
+			defer wg.Done()
+			db, err := OpenDB(path)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			db.Close()
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: %v", i, err)
+		}
+	}
 }
 
 func TestProjectCRUD(t *testing.T) {
@@ -184,6 +215,52 @@ func TestMigrationAddsAssignee(t *testing.T) {
 	}
 	if assignee.Valid {
 		t.Errorf("default assignee should be NULL; got %q", assignee.String)
+	}
+}
+
+// TestMigrationAddsAutoRunColumns verifies the autonomous-run bookkeeping
+// columns land on the tasks table and round-trip through ScanTask.
+func TestMigrationAddsAutoRunColumns(t *testing.T) {
+	db := openTempDB(t)
+	for _, col := range []string{
+		"auto_run_status", "auto_run_pid", "auto_run_started",
+		"auto_run_finished", "auto_run_log",
+	} {
+		has, err := columnExists(db, "tasks", col)
+		if err != nil {
+			t.Fatalf("columnExists(%s): %v", col, err)
+		}
+		if !has {
+			t.Errorf("column %s should exist after migration", col)
+		}
+	}
+
+	// Round-trip: write the auto-run fields, scan them back via GetTask.
+	now := NowISO()
+	wd := t.TempDir()
+	if _, err := db.Exec(
+		`INSERT INTO tasks (slug, name, status, priority, work_dir, session_id, created_at, updated_at,
+		 auto_run_status, auto_run_pid, auto_run_started, auto_run_log)
+		 VALUES (?, ?, 'in-progress', 'medium', ?, 'sess-1', ?, ?, 'running', 4242, ?, '/tmp/run.log')`,
+		"auto1", "Auto run", wd, now, now, now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	got, err := GetTask(db, "auto1")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.AutoRunStatus.String != "running" {
+		t.Errorf("AutoRunStatus = %q, want running", got.AutoRunStatus.String)
+	}
+	if !got.AutoRunPID.Valid || got.AutoRunPID.Int64 != 4242 {
+		t.Errorf("AutoRunPID = %+v, want 4242", got.AutoRunPID)
+	}
+	if got.AutoRunLog.String != "/tmp/run.log" {
+		t.Errorf("AutoRunLog = %q, want /tmp/run.log", got.AutoRunLog.String)
+	}
+	if got.AutoRunFinished.Valid {
+		t.Errorf("AutoRunFinished should be NULL while running; got %q", got.AutoRunFinished.String)
 	}
 }
 
@@ -422,4 +499,175 @@ func TestMigrationIdempotent(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	db.Close()
+}
+
+// TestMigrationHarnessSurvivesSessionInvariantRebuild pins the fix for
+// a bug where DBs upgrading from a pre-session-invariant version (e.g.
+// v0.1.0-alpha.4) lost the freshly-added tasks.harness column. The
+// rebuild in migrateTasksSessionInvariant used to omit harness from
+// tasks_new's DDL, silently dropping the column. Symptom: every
+// subsequent SELECT using TaskCols errored with "no such column:
+// harness".
+//
+// Setup: seed a tasks table that lacks the session-invariant CHECK
+// (the rebuild's idempotency guard short-circuits when present) AND
+// lacks the harness column, simulating an upgrade from before both
+// migrations existed. Then OpenDB and verify harness is present.
+func TestMigrationHarnessSurvivesSessionInvariantRebuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "flow.db")
+
+	pre, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pre.Exec(`
+		CREATE TABLE projects (
+			slug TEXT PRIMARY KEY, name TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'active', priority TEXT NOT NULL DEFAULT 'medium',
+			work_dir TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			archived_at TEXT
+		);
+		CREATE TABLE tasks (
+			slug TEXT PRIMARY KEY, name TEXT NOT NULL,
+			project_slug TEXT, status TEXT NOT NULL DEFAULT 'backlog',
+			priority TEXT NOT NULL DEFAULT 'medium', work_dir TEXT NOT NULL,
+			waiting_on TEXT, session_id TEXT, session_started TEXT,
+			session_last_resumed TEXT, created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL, archived_at TEXT
+		);
+		CREATE TABLE workdirs (
+			path TEXT PRIMARY KEY, name TEXT, git_remote TEXT,
+			last_used_at TEXT, created_at TEXT NOT NULL
+		);
+		INSERT INTO tasks (slug, name, status, priority, work_dir, created_at, updated_at)
+			VALUES ('legacy', 'Legacy task', 'backlog', 'high', '/tmp', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+	`); err != nil {
+		pre.Close()
+		t.Fatalf("seed pre-migration DB: %v", err)
+	}
+	pre.Close()
+
+	db, err := OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDB on pre-migration DB: %v", err)
+	}
+	defer db.Close()
+
+	has, err := columnExists(db, "tasks", "harness")
+	if err != nil {
+		t.Fatalf("columnExists(harness): %v", err)
+	}
+	if !has {
+		t.Fatal("tasks.harness column missing after rebuild — the session-invariant rebuild dropped it")
+	}
+
+	// TaskCols-shaped SELECT must succeed (this is the surface that
+	// errored before the fix).
+	if _, err := db.Query("SELECT " + TaskCols + " FROM tasks"); err != nil {
+		t.Errorf("SELECT TaskCols failed: %v", err)
+	}
+
+	// The legacy row should still be readable, with harness=NULL.
+	var harness sql.NullString
+	if err := db.QueryRow(`SELECT harness FROM tasks WHERE slug='legacy'`).Scan(&harness); err != nil {
+		t.Fatalf("read legacy row: %v", err)
+	}
+	if harness.Valid {
+		t.Errorf("legacy row harness should be NULL (back-compat for claude); got %q", harness.String)
+	}
+}
+
+// TestMigrationDeduplicatesSessionIDs simulates Anshul's bug: a DB
+// where two non-archived tasks share the same session_id (could
+// happen via the now-removed `flow update task --session-id` flag,
+// or a manual edit). The naive partial UNIQUE INDEX would fail to
+// create. The migration should dedupe (winner = most recent
+// updated_at) and then succeed at creating the index.
+func TestMigrationDeduplicatesSessionIDs(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "flow.db")
+
+	// Bootstrap a DB and seed two tasks sharing one session_id.
+	// Bypass OpenDB's migration by directly writing to the table
+	// after first open, then reopening to trigger migration.
+	db, err := OpenDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drop the unique index that the migration just created so we
+	// can simulate a pre-migration state with duplicates.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_tasks_session_id`); err != nil {
+		t.Fatal(err)
+	}
+	const sharedSID = "deadbeef-1111-4222-8333-444455556666"
+	now := NowISO()
+	old := "2026-01-01T00:00:00Z"
+	// Two tasks with same session_id; the one with newer updated_at
+	// should win.
+	if _, err := db.Exec(
+		`INSERT INTO tasks (slug, name, status, priority, work_dir, session_id, session_started, created_at, updated_at)
+		 VALUES ('winner', 'W', 'in-progress', 'medium', '/tmp', ?, ?, ?, ?)`,
+		sharedSID, old, old, now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO tasks (slug, name, status, priority, work_dir, session_id, session_started, created_at, updated_at)
+		 VALUES ('loser', 'L', 'done', 'medium', '/tmp', ?, ?, ?, ?)`,
+		sharedSID, old, old, old,
+	); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Reopen — the migration's dedupe step should fire.
+	db, err = OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen with duplicates failed: %v", err)
+	}
+	defer db.Close()
+
+	// Winner keeps the session_id and stays in-progress.
+	winner, err := GetTask(db, "winner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !winner.SessionID.Valid || winner.SessionID.String != sharedSID {
+		t.Errorf("winner session_id = %+v, want %s", winner.SessionID, sharedSID)
+	}
+	if winner.Status != "in-progress" {
+		t.Errorf("winner status = %q, want in-progress", winner.Status)
+	}
+
+	// Loser gets demoted: NULL session_id, status='backlog'.
+	loser, err := GetTask(db, "loser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loser.SessionID.Valid {
+		t.Errorf("loser session_id should be NULL, got %q", loser.SessionID.String)
+	}
+	if loser.Status != "backlog" {
+		t.Errorf("loser status = %q, want backlog (demoted)", loser.Status)
+	}
+
+	// The unique index should now exist.
+	var idxSQL sql.NullString
+	if err := db.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_tasks_session_id'`,
+	).Scan(&idxSQL); err != nil {
+		t.Fatalf("unique index missing after migration: %v", err)
+	}
+	if !idxSQL.Valid {
+		t.Error("unique index DDL is NULL")
+	}
+
+	// Idempotent: opening again is a no-op.
+	db.Close()
+	db2, err := OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("second reopen failed: %v", err)
+	}
+	db2.Close()
 }

@@ -101,6 +101,17 @@ an intent, follow the matching recipe instead of re-asking via §1a.
   own session, its own snapshotted `brief.md`, and its own
   `updates/`. Editing a playbook's `brief.md` does not affect past
   runs; runs are reproducible.
+- **Owners** are durable, named, repo-scoped *self-prompting controllers*
+  that take ongoing responsibility for an outcome (e.g. "keep all PRs in
+  repo X green"; "maintain repo Y: fix bugs → PR → merge → deploy → verify").
+  An owner is NOT a single Claude session — it is state (a `charter.md`
+  operating manual + a ledger) plus a clock: each tick it runs a *fresh
+  headless tick* (a brand-new session each time), acts, then **self-paces**
+  its next wake (`flow owner next`); `--every` is only the fallback
+  heartbeat floor, not a fixed schedule. Each owner has a slug, work_dir,
+  optional `project_slug`, a status (`active`/`paused`/`retired`), and an
+  interval. The tasks an owner creates or manages are tagged `owner:<slug>`;
+  a task it parks for a human decision is also tagged `question`. See §4.17.
 - **Workdirs** is a convenience registry of known local repo paths. It
   exists so this skill can match repo intent ("the budgeting app")
   to a path on disk. It is not the source of truth for any task's
@@ -182,16 +193,36 @@ Create
   flow add project "<name>" --work-dir <path> [--slug <s>] [--priority h|m|l] [--mkdir]
   flow add task    "<name>" [--slug <s>] [--project <slug>] [--work-dir <path>] [--mkdir]
                            [--priority high|medium|low] [--due <date>] [--assignee <name>]
+                           [--tag <t> ...]
   flow add playbook "<name>" --work-dir <path> [--slug <s>] [--project <slug>] [--mkdir]
+  flow add owner    "<name>" --work-dir <path> --every <dur> [--slug <s>] [--project <slug>] [--mkdir]
 
 Sessions
   flow do               <ref> [--fresh] [--dangerously-skip-permissions] [--force]
+                              [--with "<instruction>" | --with-file <path>]
   flow do --here        <ref> [--force]   (bind THIS Claude session to the task — no new tab)
+  flow do --auto        <ref> [--with "<instruction>" | --with-file <path>]
+                              (run headlessly in the background — no tab, no human; the
+                               session does the work and self-completes via `flow done`.
+                               Implies --dangerously-skip-permissions. Cannot combine with --here.)
   flow done             <ref>
 
 Playbook runs
-  flow run playbook <slug>          spawn a fresh run session (new task with kind=playbook_run)
+  flow run playbook <slug> [--with "<instr>" | --with-file <path>]
+                                    spawn a fresh run session (new task with kind=playbook_run)
+  flow run playbook <slug> --here   bind THIS Claude session to the new run (no new tab)
+  flow run playbook <slug> --auto   run the playbook headlessly in the background (no tab, no human)
   flow list runs [<playbook-slug>]  list playbook runs (filter by playbook optional)
+
+Owners (autonomous ownership — see §4.17)
+  flow owner list                   all owners with status + next tick   (alias: flow list owners)
+  flow owner show   <slug>          charter + what it owns (in-flight / playbook runs / questions) + next tick   (alias: flow show owner <slug>)
+  flow owner start  <slug>          begin ticking — first tick now, then every <dur> (reactivates a paused OR retired owner)
+  flow owner pause  <slug>          stop ticking, keep all state
+  flow owner tick   <slug>          wake the owner NOW, interactively (a tab you drive); --auto = headless now
+  flow owner next   <slug> --in <dur> | --at <when>   set the next tick time (how a tick self-paces)
+  flow owner retire <slug> [--delete]   stop permanently (status=retired+archived); --delete removes row + dir
+  (scheduled ticks run headlessly; `flow owner tick` is the on-demand / guided-first-run path)
 
 Read
   flow show task    [<ref>]     (no arg → reverse-lookup via $CLAUDE_CODE_SESSION_ID)
@@ -546,6 +577,13 @@ its own, it's the start of a two-or-more-step workflow.
 - "start X" / "start on X" / "begin X" / "get going on X"
 - A bare "`flow do X`" typed as command-like input
 
+**Autonomous-mode triggers — these mean `flow do --auto <ref>`** (a
+headless background run with no human at the keyboard):
+- "run X autonomously" / "run X unattended" / "run X headlessly"
+- "do X in the background" / "kick off X and walk away" / "fire and forget X"
+- "have X run on its own" / "let X complete by itself"
+- A bare "`flow do --auto X`" typed as command-like input
+
 **Recipe:**
 
 1. **Ask the user which session mode they want** before running anything.
@@ -557,8 +595,9 @@ its own, it's the start of a two-or-more-step workflow.
        question: "Which session mode for <task-slug>?",
        header: "Session mode",
        options: [
-         { label: "Regular",          description: "Normal Claude session with tool-approval prompts (safer)" },
-         { label: "Skip permissions", description: "Pass --dangerously-skip-permissions (faster, no prompts)" }
+         { label: "Regular",                description: "Normal Claude session with tool-approval prompts (safer)" },
+         { label: "Skip permissions",        description: "Pass --dangerously-skip-permissions (faster, no prompts)" },
+         { label: "Autonomous (background)", description: "flow do --auto — headless, no tab, no human. The session does the work and self-completes via flow done. Implies skip-permissions." }
        ],
        multiSelect: false
      }]
@@ -566,14 +605,47 @@ its own, it's the start of a two-or-more-step workflow.
    ```
 
    If the user already specified a mode in their request (e.g. "do X
-   with skip permissions", "do X normally"), use that — don't re-ask.
+   with skip permissions", "do X normally", "run X autonomously"), use
+   that — don't re-ask.
 2. Run: `flow do <user's ref>`. Pass the slug the user gave as one
    positional argument. Resolution is exact slug match. Append
-   `--dangerously-skip-permissions` if the user chose skip-permissions.
+   `--dangerously-skip-permissions` if the user chose skip-permissions,
+   or `--auto` if the user chose Autonomous (background) — `--auto`
+   already implies skip-permissions, so don't add both.
 3. If the command errors with "no task matching", ask the user to clarify
    or offer `flow add task` instead.
 4. Pass `--fresh` ONLY if the user explicitly asked for a fresh session
    (e.g. "start over", "fresh session", "--fresh"). Never on your own.
+
+**Autonomous mode (`--auto`) — how it differs:**
+
+- `flow do --auto <slug>` launches a **detached, headless** Claude run
+  in the background instead of opening a terminal tab. It returns
+  **immediately** — there is no tab to focus and no human drives it.
+  The run does the work end to end on best judgment and calls
+  `flow done` on **itself** when the brief's "Done when" is met, which
+  still triggers the close-out KB/project sweep.
+- `--auto` **implies `--dangerously-skip-permissions`** (no human to
+  approve tool calls) and **cannot be combined with `--here`**
+  (`--here` binds the current session; `--auto` spawns its own).
+- `--auto` **can** take `--with "<instruction>"` / `--with-file <path>`:
+  a one-off directive is forwarded to the run and layered on top of the
+  brief — useful for an unattended task or a scheduled playbook run that
+  today should also check something specific.
+- **Run status.** An autonomous run carries its own lifecycle, surfaced
+  on the task: `running` → `completed` (it self-`flow done`d) or `dead`
+  (it crashed or exited without marking done). `flow show task` shows
+  `auto_run: running (pid …) | completed | dead` and a log path under
+  `tasks/<slug>/auto-runs/`; `flow list tasks` has a dedicated `AUTO`
+  column (a running row shows `running <pid>`). When the user asks "how
+  did the autonomous run go?", read those — a `dead` run means it needs
+  a human's eyes (check the log), `completed` means it finished and
+  closed itself out.
+- **After `flow do --auto` succeeds**, report that the background run
+  was launched (mention the run is headless and will self-complete) and
+  stop. Do NOT poll the run, tail its log on a timer, or try to peek at
+  its separate session — it's an independent process. The user can ask
+  for status later (read `auto_run` then).
 
 **After `flow do` succeeds** it has already spawned a terminal tab and
 exported the env vars. Your job is done. Report "opened tab: <title>"
@@ -635,6 +707,57 @@ suggest the user reinstall flow, do not attempt to grant Accessibility
 yourself. macOS guards Accessibility deliberately — there is no CLI to
 self-grant it, and Claude cannot bypass that.
 
+#### Surgical instructions: `--with` and `--with-file`
+
+**Triggers:** the user wants to *fire a one-off instruction at a task*
+without opening the tab to type it themselves. Phrasings:
+
+- "tell <task> to <do X>"
+- "nudge <task> to check <Y>"
+- "have <task> verify <Z>"
+- "fire <instruction> at <task>"
+- "ping <task> with <instruction>"
+- "ask <task> whether <Q>"
+
+**Recipe:** add `--with "<instruction>"` to the `flow do` invocation.
+Quote the instruction as a single shell-safe string. The session
+receives it as its first user message, prefixed with
+`[via flow do --with]` so the model knows it's an injected instruction
+rather than typed input.
+
+**Use `--with-file <path>` when:** the instruction is a longer brief
+the user already wrote down (a checklist, a multi-step recipe, a
+one-pager). flow does NOT embed the file contents — it injects
+`read instructions at <abs-path>` and the session uses its Read tool
+to load it. No size limits. Use this whenever the user references a
+file ("the brief in ~/notes/X.md", "the checklist at triage.md").
+
+**The flags are mutually exclusive.** If the user mixes them, ask via
+AskUserQuestion which one they meant.
+
+**`--with` on a `done` task** auto-rolls it back to in-progress and
+proceeds. This is the supported lane for "nudge a parked task" — do
+NOT pre-flip status yourself; just pass `--with` and let `flow do`
+handle the reopen. The binary prints a stderr notice
+(`--with on done task "X": reopening as in-progress`) — relay it
+verbatim.
+
+**`--with` is incompatible with `--here`.** `--here` binds the
+current session with no spawn, so there's no first message to inject;
+the binary rejects the combination with rc=2. If the user wants to
+both bind-here AND act on an instruction, they're already in the
+session — just do the work directly, no `--with` needed.
+
+**Same flags work on `flow run playbook <slug>`** — use them when the
+user wants a one-off instruction layered on top of a fresh playbook
+run (e.g. a scheduled run that today should also "double-check the
+Acme deal status").
+
+**When NOT to use `--with`:** if the user is opening the tab to work
+in it themselves. `--with` is for fire-and-forget nudges, not for
+"open the tab with this prompt pre-typed for me". When the user will
+be at the keyboard, run plain `flow do <slug>`.
+
 ### 4.5 Save a progress note
 
 **Triggers:** "save a note", "log progress", "write an update", "note
@@ -663,6 +786,11 @@ that…", "record that I…", "document that I just…".
      ("noticed flaky output when X", "next iteration should consolidate
      steps 2 and 3"). Use this when capturing things that should inform
      the playbook itself, not a single run.
+   - For an **owner**, notes go under `~/.flow/owners/<slug>/updates/` —
+     this is the owner's cross-tick **journal** (§4.17). Each headless
+     tick reads the recent notes here to recover what it dispatched and
+     what to check, and appends a new note before exiting. Same `updates/`
+     convention as tasks and playbooks.
 5. Use the `Write` tool to create
    `~/.flow/tasks/<slug>/updates/<filename>.md` with the confirmed
    content. If the user is noting project-level progress, use
@@ -990,6 +1118,12 @@ prose "want me to...?" question). Its purpose is to keep a task's
 transcript and update log focused, instead of letting unrelated work
 pile up under whichever task happens to own the current terminal tab.
 
+In a bound session a `UserPromptSubmit` hook re-injects a one-line
+anchor on every prompt (naming the bound task and citing §4.11/§4.7),
+so this check — and the §4.7 close-out check — stay live over a long
+session instead of decaying. The hook only re-anchors; the judgment
+below is still yours.
+
 **When to consider firing:**
 
 Fire when the *work itself* (not a single question) has clearly moved
@@ -1118,17 +1252,55 @@ stop.
 - "run the X playbook" / "trigger X" / "fire the X playbook"
 - "fire the X agent" (legacy term users may use — playbook is the canonical name)
 - "start a run of X" / "kick off X"
+- "run X autonomously / unattended / in the background" → the `--auto`
+  run mode below
 - A bare `flow run playbook X` typed as command
 
 **Recipe:**
 
-1. Ask session-mode (Regular vs Skip permissions) via AskUserQuestion —
-   reuses the §4.4 pattern. Skip if the user already specified.
-2. Run: `flow run playbook <slug>` (with `--dangerously-skip-permissions`
-   if chosen).
-3. The command creates a kind=playbook_run task, snapshots the brief,
-   and spawns a terminal tab. The new tab will boot the flow skill via its
-   bootstrap prompt and execute against the snapshotted brief.
+1. Probe binding with `flow show task` (no arg). If it errors with
+   `not bound to a task`, this is a dispatch (unbound) session — the
+   in-session bind option is available. If it resolves a task, this
+   session is already bound; only the new-tab path is available.
+
+2. Use AskUserQuestion to pick the run mode. **Unbound session — four
+   options** (header: "Run mode?"):
+
+   - **In this session (bind here)** — runs `flow run playbook <slug> --here`.
+     The new playbook-run task is created, the brief is snapshotted, and THIS
+     conversation is bound to it. No new tab. Pick when the user wants the
+     playbook to execute in the current chat (preserves transcript, no tab
+     switch). Implicitly skips the `--dangerously-skip-permissions` question
+     — there's no claude spawn to forward it to.
+   - **New tab — regular** — runs `flow run playbook <slug>`. Spawns a
+     fresh tab with tool-approval prompts.
+   - **New tab — skip permissions** — runs `flow run playbook <slug>
+     --dangerously-skip-permissions`. Spawns a fresh tab without
+     approval prompts (faster).
+   - **Autonomous (background)** — runs `flow run playbook <slug>
+     --auto`. Headless, no tab, no human: the run does the work and
+     self-completes via `flow done`. Implies skip-permissions; cannot
+     combine with `--here`. Pick this for unattended / scheduled runs.
+     Returns immediately — report that the run was launched and stop
+     (don't poll it). Run status surfaces as `auto_run: running |
+     completed | dead` on the run-task (see §4.4's autonomous-mode notes).
+
+   **Bound session — three options** (header: "Run mode?", same options
+   minus "In this session"): the binary refuses `--here` when the
+   current session is already bound (session_id uniqueness invariant;
+   `--force` does not override). Offering it would surface an option
+   the binary will reject — bad UX. (Autonomous still applies — it
+   spawns its own detached run, independent of the current binding.)
+
+3. Run the chosen invocation. Skip the session-mode question entirely
+   if the user already specified a mode in their request (e.g. "fire X
+   in this session", "run X in a new tab", "run X autonomously").
+
+4. The command creates a kind=playbook_run task and snapshots the brief
+   in both paths. On the new-tab path it spawns a terminal tab that
+   boots the flow skill. On the `--here` path it binds the current
+   session — your job is to invoke the flow skill yourself and proceed
+   against the snapshotted brief at `~/.flow/tasks/<run-slug>/brief.md`.
 
 **Anti-pattern (per §8):** never auto-fire. Manual trigger only. Even if
 the user mentions a playbook name in passing, do not run it without an
@@ -1458,12 +1630,75 @@ police these):
   session_id bound. `--force` overrides this case (and only this
   case), but the user has been told it orphans the target's
   prior session.
+- Refuses if **this Claude session's spawn directory ≠
+  `task.work_dir`**. Flow maintains the invariant *any task with
+  a session_id has work_dir equal to the cwd that session was
+  created at* — that's what makes `flow do <slug>` resumes find
+  the harness's on-disk transcript (the path is keyed by encoded
+  cwd). The check is honest: the binary stats the expected
+  transcript file on disk, not `os.Getwd()`. **`cd <work_dir>
+  && flow do --here` does NOT bypass this** — the chained `cd`
+  only changes the flow subprocess's cwd, not where the actual
+  Claude session jsonl was written. `--force` does NOT override
+  this gate — see the sub-recipe below.
 - No-op (idempotent) if the target is already bound to this same
   session.
 - Refuses if the target is `done`. Reopen via
   `flow update task <slug> --status in-progress` first; the
   prior session_id is preserved across done, so `--here` becomes
   unnecessary after reopen.
+
+**Cwd-mismatch sub-recipe:**
+
+When `flow do --here <slug>` exits non-zero with stderr
+containing "the harness transcript isn't where work_dir says",
+the binary stat'd the expected transcript path on disk and it
+didn't exist — meaning **the Claude session you're currently in
+was started in a directory other than `task.work_dir`.** This is
+a fact about the running Claude process, not about your current
+Bash shell cwd. Whatever directory you `cd` into now does NOT
+change where the session jsonl was written. The binary's check
+detects this and refuses; trying to retry from a different cwd
+won't help.
+
+Surface the choice via `AskUserQuestion` — do **not** auto-retry,
+and **do not run `cd <work_dir> && flow do --here <slug>`** in
+the hope of getting past the check. That doesn't work and will
+hit the same refusal:
+
+```
+AskUserQuestion({
+  questions: [{
+    question: "This Claude session was started in a different directory than task `<slug>`'s work_dir (<work_dir>). The session's on-disk transcript isn't where future `flow do` resumes would look. What do you want to do?",
+    header: "Cwd mismatch",
+    options: [
+      { label: "Open in a new tab (Recommended)",  description: "Run `flow do <slug>` to spawn a fresh Claude session at the task's work_dir. THIS session stays unbound and keeps doing whatever it was doing. Best when you weren't really working on the task here." },
+      { label: "Point work_dir at THIS session's directory", description: "If you actually want this Claude session to own the task, update the task's work_dir to wherever this Claude was started (you'll need to figure that out — try the cwd of the shell that launched Claude). I'll then retry --here. Allowed even when a session is already bound, but the new work_dir must match where the harness transcript actually lives." }
+    ],
+    multiSelect: false
+  }]
+})
+```
+
+On "Open in a new tab" → run `flow do <slug>` (no `--here`).
+THIS session stays unbound; the task gets its own new session
+at work_dir.
+
+On "Point work_dir at THIS session's directory" → ask the user
+what cwd Claude was started in (they typed `claude` from
+somewhere — that's the path). Then run
+`flow update task <slug> --work-dir <real-cwd>`, then
+`flow do --here <slug>`. The work_dir update will succeed only
+if the harness transcript is actually at the named path
+(binary validates by stat). If the user picks the wrong path,
+the update errors with "harness transcript isn't there"; ask
+them to try again.
+
+**Why "cd then retry" is NOT listed as an option:** the binary
+verifies the on-disk transcript path, which is fixed at Claude
+session start. Bash subprocess cwd is irrelevant. `cd
+<work_dir> && flow do --here` will produce the same refusal as
+`flow do --here` from anywhere else — it's not a workaround.
 
 **Anti-patterns:**
 
@@ -1472,10 +1707,161 @@ police these):
 - **Do not bind without confirming the task slug.** If multiple
   tasks could plausibly own this conversation, AskUserQuestion to
   pick.
+- **Do not try `cd <work_dir> && flow do --here` to bypass a
+  cwd-mismatch refusal.** The check stats the on-disk transcript
+  path; chained-cd doesn't change where the jsonl is. The binary
+  will refuse identically.
+- **Do not try `--force` to bypass a cwd-mismatch refusal.**
+  `--force` overrides "already bound to a different session"
+  but NOT the cwd invariant. Pick one of the two sub-recipe
+  remedies instead.
 - **Do not run `--here` from a different tab to attach a session
   in another tab.** The env var is per-process; `--here` always
   attaches the *current* session. To attach a session in another
   tab, switch to that tab and run `flow do --here` there.
+
+### 4.17 Owners (autonomous ownership)
+
+An **owner** takes durable, ongoing responsibility for an outcome and drives
+it itself — re-waking, re-evaluating, acting — instead of a one-shot run. It
+is **not a single Claude session**: it's a `charter.md` (operating manual) +
+a `updates/` journal + a clock. Each interval it runs a **fresh headless
+tick** (new session) that reads the charter + journal, reviews what it owns,
+orchestrates, self-paces its next wake, and exits.
+
+**Triggers:** "create an owner for X", "keep X true", "automate maintenance
+of <repo>", "own <repo>'s bug-fixing", "run this on a loop".
+
+**Creating one — operational interview** (the charter is the *how-to-operate*
+manual). Ask one at a time: (1) **what it owns** (one sentence); (2) **where**
+(work_dir, §6 recipe); (3) **how to observe & act** — what to watch (PRs, CI,
+prod health) and do when off-target, bootstrapping from CLAUDE.md / KB /
+workdir registry / `gh`, asking only the gaps; (4) **when to ask vs. act**;
+(5) **fallback interval** `--every` (optional, default 24h) — NOT a fixed
+schedule, just the heartbeat floor (ticks self-pace). Then `flow add owner
+"<name>" --work-dir <p> [--every <dur>] [--project <s>] [--slug <s>]`, write
+the manual into `charter.md` (Read stub once, then Write), and offer to `flow
+owner start <slug>`.
+
+**The tag contract (how everything an owner touches is tracked):**
+- Every task an owner creates/manages is tagged **`owner:<slug>`** → its
+  ledger is `flow list tasks --tag owner:<slug>`, and the tag renders on
+  `flow show task` (bidirectional). Playbook *runs* it triggers are tasks
+  too — tag them likewise.
+- A task it parks for a human is **also tagged `question`** (assigned to the
+  user) — a normal task, **never `--auto`**, surfacing in the user's queue.
+
+**Orchestrate, never execute inline.** A tick is *sessionless* and never
+calls `flow done`, so work done directly is lost to the KB (no sweep, no
+transcript). Route EVERY piece of work through a unit that self-closes:
+**recurring → a playbook** (`flow run playbook <slug> --auto`), **one-time →
+a task** (`flow add task "<what>" --tag owner:<slug>` then `flow do --auto
+<task>`), **a human decision → a question task** (`--tag question --tag
+owner:<slug>`). The tick *dispatches*; it never does the fix-work itself.
+
+**The tick procedure** (the tick's own prompt enforces this; restated for the
+human-side picture). Each tick: read `charter.md`; read recent
+`owners/<slug>/updates/` (its **journal** — what it dispatched / is waiting
+on); review what it owns via **`flow owner show <slug>`** (NOT `flow list
+tasks`, which hides playbook runs); dispatch the needed runs/tasks/questions;
+**self-pace** the next wake (`flow owner next <slug> --in <dur> | --at
+<when>`); append a journal note (what it saw, dispatched-with-slugs, what to
+check next). The next tick starts blank and knows only the journal + task
+records. No AskUserQuestion, no blocking; conservative with
+irreversible/outward actions unless the charter allows; never re-spawn an
+in-progress run.
+
+**Answering an owner's question (human side):** it's a normal task tagged
+`question` + `owner:<slug>`. Read it (`flow show task <q>`) or `flow do` it,
+capture the answer on the task, **mark it done** — the owner reads it next
+tick and won't ask again. "What does <owner> need from me?" → `flow list
+tasks --tag owner:<slug> --tag question`.
+
+**Status:** `flow owner show <slug>` (charter, status, next tick, in-flight /
+runs / questions); `flow owner list` (all owners + next tick).
+
+**Waking on demand / the first tick.** Scheduled ticks fire automatically,
+but `flow owner tick <slug>` runs one **now** — interactive by default
+(spawns a tab the user drives; MAY use AskUserQuestion, can refine the
+charter live); `--auto` runs it headless. It's an extra tick, doesn't disturb
+the schedule. **Strongly prefer an interactive FIRST tick:** when an owner
+shows `last tick: (never)`, offer (via AskUserQuestion) to run it
+interactively so the user navigates the agent and tunes the charter before it
+runs unattended (like playbook first-run capture, §4.13). Then let the
+scheduler take over.
+
+**Event-driven owners (advanced; default is poll-based).** By default an
+owner is a *poller* — scheduled ticks, self-paced via `flow owner next`. For
+a window that needs faster reaction than polling (a deploy in flight, a CI
+run, a PR's checks), an owner can become **event-driven** — but a tick is
+headless and **exits**, so it cannot hold a Monitor itself. Instead the tick
+spins up a **bounded watcher** and goes back to sleep:
+
+- The tick dispatches a one-time TASK (`flow add task "watch <event> for
+  <owner>" --tag owner:<slug>`, then `flow do --auto`) whose brief says: use
+  the **Monitor tool** to watch `<event>` with a clear stop condition **and**
+  a timeout.
+- When the event fires, that watcher session (a) appends a focus note to the
+  owner's journal (`owners/<slug>/updates/<today>-EVENT.md` — what fired,
+  what to check), then (b) runs `flow owner tick <slug> --auto` to fire a
+  **focused tick** now, then **exits**.
+- The triggered tick reads the journal (its normal step 3), sees the focus
+  note, acts on it, and re-sleeps at its normal cadence. (`flow owner tick
+  --auto` is overlap-guarded, so an event trigger that races a scheduled tick
+  won't double-fire.)
+
+This gives both modes from one primitive: cheap spaced **polling** by
+default, an event-driven **focused tick** on demand — without keeping a mind
+alive between events. **Bounded only:** the watcher is a living session that
+costs tokens while it watches, so use it for windows with a clear end (deploy
+/ CI / PR-checks), **never** as a permanent watcher (that's back to the
+expensive long-running-session model an owner exists to avoid). Always give
+the watcher a timeout so a never-fired event doesn't strand it running.
+
+**Lifecycle:** `start` begins ticking; `pause` stops but keeps state (resume
+with `start`); `flow owner retire <slug>` stops it (retired+archived — no
+longer ticks, off the default list, but charter/journal/owned-tasks
+preserved). Retire is reversible: `flow owner start <slug>` reactivates a
+paused OR retired owner (it un-archives and schedules a tick now). For a
+truly permanent removal, `--delete` hard-removes the row +
+`owners/<slug>/` dir (use instead of editing the DB; owned tasks survive).
+Confirm retire/delete via AskUserQuestion (`--delete` is destructive). Edit
+the charter directly at `owners/<slug>/charter.md`.
+
+**Ensuring the tick scheduler (host setup, once per machine).** flow has **no
+daemon and no OS-specific scheduler code** — it only provides `flow owner
+tick-due` (scan due owners, dispatch detached ticks). Firing it on an
+interval is **this skill's job, per host**. When the user creates/starts
+their first owner — or asks "are my owners running?" — ensure (idempotently:
+check → install if missing → reload if dropped) a host scheduler runs `flow
+owner tick-due` ~every 60s:
+- **macOS (launchd):** if `launchctl list | grep
+  cloud.facets.flow.owner-scheduler` is absent, write
+  `~/Library/LaunchAgents/cloud.facets.flow.owner-scheduler.plist` —
+  `Label`, `ProgramArguments=[<abs flow>, owner, tick-due]`,
+  `StartInterval=60`, `RunAtLoad=true`,
+  `StandardOut/ErrorPath=~/.flow/owner-scheduler.{log,err.log}`, and —
+  **CRITICAL** — `EnvironmentVariables.PATH` = the user's full interactive
+  `$PATH` (launchd's default PATH is minimal; without it the tick fails
+  `exec: "claude": executable file not found` — claude/gh/git live in
+  ~/.local/bin, homebrew). `launchctl load -w <plist>` (or `bootstrap
+  gui/$UID`), then verify with `launchctl list`.
+- **Linux:** a systemd **user** timer (`OnUnitActiveSec=60s` + a `.service`
+  running `flow owner tick-due`), or `* * * * * <flow> owner tick-due` in
+  crontab.
+
+It's **opt-in** (owners then run unattended until paused/unloaded) — offer
+via AskUserQuestion; never install silently. Re-verify/respawn whenever the
+user touches owners. **Stop all:** unload the plist; **stop one:** `flow
+owner pause`.
+
+**Anti-patterns:**
+- **Don't auto-create owners** — explicit request only (they run unattended).
+- **Don't let a tick execute work inline** — sessionless, no sweep/transcript;
+  orchestrate via playbook/task runs that self-close.
+- **Don't `--auto` a `question`-tagged task** — it's for the human.
+- **Don't invoke `flow __owner-tick` / `flow owner tick-due` by hand** —
+  scheduler internals.
 
 ## 6. The `work_dir` question — rules
 

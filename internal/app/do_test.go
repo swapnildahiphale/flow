@@ -1,15 +1,42 @@
 package app
 
 import (
+	"bytes"
 	"errors"
 	"flow/internal/flowdb"
+	"flow/internal/harness/claude"
 	"flow/internal/iterm"
 	"flow/internal/spawner"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 )
+
+// stubPS replaces claude.PSRunner with a canned-output stub so the
+// live-session guard in cmdDo can be exercised without touching the
+// real process table. Replaces the legacy app-package `psRunner`
+// override the test suite used before the harness refactor.
+func stubPS(t *testing.T, output string) {
+	t.Helper()
+	old := claude.PSRunner
+	claude.PSRunner = func() ([]byte, error) {
+		return []byte(output), nil
+	}
+	t.Cleanup(func() { claude.PSRunner = old })
+}
+
+// stubNewUUID pins claude.NewUUID to a fixed value for the duration
+// of the test.
+func stubNewUUID(t *testing.T, sid string) {
+	t.Helper()
+	old := claude.NewUUID
+	claude.NewUUID = func() (string, error) { return sid, nil }
+	t.Cleanup(func() { claude.NewUUID = old })
+}
 
 // stubITerm replaces iterm.Runner with a counter + captured-script
 // recorder. Returns the counter pointer and a function that reads the
@@ -56,9 +83,50 @@ func seedTask(t *testing.T, slug string) {
 	}
 }
 
+// seedTaskAtCwd creates a task with work_dir set to the test process's
+// current cwd. Used by --here tests that want to satisfy the
+// cwd-mismatch invariant without contriving a chdir.
+func seedTaskAtCwd(t *testing.T, slug string) {
+	t.Helper()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	if rc := cmdAdd([]string{"task", slug, "--work-dir", cwd}); rc != 0 {
+		t.Fatalf("seed task rc=%d", rc)
+	}
+}
+
+// stubClaudeStatOK makes claude.ValidateSession succeed for every
+// (workDir, sessionID) pair, for tests that don't materialize fake
+// jsonl files under a temp $HOME. Counterpart helper for the
+// negative case is stubClaudeStatMissing.
+func stubClaudeStatOK(t *testing.T) {
+	t.Helper()
+	old := claude.StatFn
+	claude.StatFn = func(string) error { return nil }
+	t.Cleanup(func() { claude.StatFn = old })
+}
+
+// stubClaudeStatMissing makes claude.ValidateSession refuse every
+// pair as "file not found." Models the chained-cd cheat and any
+// other case where the on-disk jsonl doesn't match work_dir.
+func stubClaudeStatMissing(t *testing.T) {
+	t.Helper()
+	old := claude.StatFn
+	claude.StatFn = func(p string) error {
+		return &os.PathError{Op: "stat", Path: p, Err: os.ErrNotExist}
+	}
+	t.Cleanup(func() { claude.StatFn = old })
+}
+
 // TestCmdDoLiveSessionGuard checks that a task whose session_id is in
-// the live-claude-process set refuses to spawn unless --force is passed.
-// This is feature 3 of the bundled fields/sessions task.
+// the live-claude-process set refuses to spawn (when focus can't find
+// the tab) unless --force is passed. This is feature 3 of the
+// bundled fields/sessions task. The focus path is short-circuited by
+// stubbing iterm.PSRunner with empty output so ttyForClaudeSession
+// returns "" → FocusSession returns (false, nil) → fall through to
+// the original error message.
 func TestCmdDoLiveSessionGuard(t *testing.T) {
 	setupFlowRoot(t)
 	seedTask(t, "live-task")
@@ -75,24 +143,154 @@ func TestCmdDoLiveSessionGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Make ps say this UUID is alive.
+	// Make ps (the app-level psRunner) say this UUID is alive so the
+	// live guard fires.
 	stubPS(t, "  PID COMMAND\n12345 /bin/claude --session-id "+pinnedSID+"\n")
+
+	// Make iterm.PSRunner (the focus-path probe) return no rows so the
+	// focus attempt deterministically returns (false, nil) and we fall
+	// through to the original "running elsewhere" error.
+	oldFocusPS := iterm.PSRunner
+	iterm.PSRunner = func() ([]byte, error) { return []byte(""), nil }
+	t.Cleanup(func() { iterm.PSRunner = oldFocusPS })
 
 	count, _ := stubITerm(t)
 	if rc := cmdDo([]string{"live-task"}); rc != 1 {
-		t.Errorf("cmdDo: rc=%d, want 1 when live session blocks spawn", rc)
+		t.Errorf("cmdDo: rc=%d, want 1 when live session blocks spawn (focus miss)", rc)
 	}
 	if *count != 0 {
 		t.Errorf("iterm spawn count = %d, want 0 (guard should block)", *count)
 	}
 
-	// --force should bypass the guard. iTerm runner is still stubbed
-	// from above, so spawning will succeed.
+	// --force should bypass the guard (and the focus attempt). iTerm
+	// runner is still stubbed from above, so spawning will succeed.
 	if rc := cmdDo([]string{"live-task", "--force"}); rc != 0 {
 		t.Errorf("cmdDo --force: rc=%d, want 0 (guard bypassed)", rc)
 	}
 	if *count != 1 {
 		t.Errorf("iterm spawn count after --force = %d, want 1", *count)
+	}
+}
+
+// TestCmdDoLiveSessionFocusesExistingTab pins the new behavior: when a
+// task's session is already running AND the active backend can locate
+// its tab, `flow do` focuses that tab and exits 0 instead of erroring.
+// No new tab is spawned.
+func TestCmdDoLiveSessionFocusesExistingTab(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "open-task")
+
+	const pinnedSID = "abcdef12-3456-4789-8abc-def012345678"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, session_started=? WHERE slug='open-task'`,
+		pinnedSID, flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// App-level liveClaudeSessions sees the UUID as alive.
+	stubPS(t, "  PID COMMAND\n12345 /bin/claude --session-id "+pinnedSID+"\n")
+
+	// iterm focus path: ps yields a row with tty, then osascript
+	// reports "ok" → FocusSession returns (true, nil).
+	oldFocusPS := iterm.PSRunner
+	iterm.PSRunner = func() ([]byte, error) {
+		return []byte("  PID TTY      COMMAND\n12345 ttys012  /bin/claude --session-id " + pinnedSID + "\n"), nil
+	}
+	t.Cleanup(func() { iterm.PSRunner = oldFocusPS })
+
+	oldRunnerOut := iterm.RunnerOutput
+	iterm.RunnerOutput = func(args []string) ([]byte, error) { return []byte("ok\n"), nil }
+	t.Cleanup(func() { iterm.RunnerOutput = oldRunnerOut })
+
+	count, _ := stubITerm(t)
+	if rc := cmdDo([]string{"open-task"}); rc != 0 {
+		t.Errorf("cmdDo when focus succeeds: rc=%d, want 0", rc)
+	}
+	if *count != 0 {
+		t.Errorf("iterm spawn count = %d, want 0 (focus should not spawn)", *count)
+	}
+}
+
+// TestCmdDoLiveSessionDuplicateProcessesWarn covers the duplicate-tab
+// detection path. ps reports two claude processes running the same
+// session UUID; cmdDo should emit a warning to stderr (so the user
+// knows the duplicate exists and that transcript writes may race),
+// then proceed to focus the first match. We assert that focus still
+// succeeds (rc=0, no spawn) and the duplicate count surfaces in the
+// captured stderr.
+func TestCmdDoLiveSessionDuplicateProcessesWarn(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "dup-task")
+
+	const pinnedSID = "abcdef12-3456-4789-8abc-def012345678"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, session_started=? WHERE slug='dup-task'`,
+		pinnedSID, flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// App-level psRunner reports TWO claude processes for the same UUID.
+	stubPS(t,
+		"  PID COMMAND\n"+
+			"12345 /bin/claude --session-id "+pinnedSID+"\n"+
+			"67890 /bin/claude --resume "+pinnedSID+"\n",
+	)
+
+	// iterm focus succeeds against the first match.
+	oldFocusPS := iterm.PSRunner
+	iterm.PSRunner = func() ([]byte, error) {
+		return []byte(
+			"  PID TTY      COMMAND\n" +
+				"12345 ttys012  /bin/claude --session-id " + pinnedSID + "\n" +
+				"67890 ttys013  /bin/claude --resume " + pinnedSID + "\n",
+		), nil
+	}
+	t.Cleanup(func() { iterm.PSRunner = oldFocusPS })
+
+	oldRunnerOut := iterm.RunnerOutput
+	iterm.RunnerOutput = func(args []string) ([]byte, error) { return []byte("ok\n"), nil }
+	t.Cleanup(func() { iterm.RunnerOutput = oldRunnerOut })
+
+	stderr := captureStderr(t)
+	count, _ := stubITerm(t)
+	if rc := cmdDo([]string{"dup-task"}); rc != 0 {
+		t.Errorf("cmdDo with duplicates: rc=%d, want 0 (focus should still succeed)", rc)
+	}
+	if *count != 0 {
+		t.Errorf("iterm spawn count = %d, want 0 (focus should not spawn)", *count)
+	}
+	got := stderr()
+	for _, want := range []string{"2 claude processes", pinnedSID, "may race"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("warning missing %q\n--- stderr ---\n%s", want, got)
+		}
+	}
+}
+
+// captureStderr redirects os.Stderr through an os.Pipe for the duration
+// of the test and returns a closure that drains and returns whatever
+// was written. The original stderr is restored on Cleanup.
+func captureStderr(t *testing.T) func() string {
+	t.Helper()
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() {
+		os.Stderr = origStderr
+	})
+	return func() string {
+		_ = w.Close()
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		_ = r.Close()
+		return buf.String()
 	}
 }
 
@@ -106,9 +304,7 @@ func TestCmdDoFreshAllocatesSessionID(t *testing.T) {
 	_, getScript := stubITerm(t)
 
 	const pinnedSID = "11111111-2222-3333-4444-555555555555"
-	oldNewUUID := newUUID
-	newUUID = func() (string, error) { return pinnedSID, nil }
-	t.Cleanup(func() { newUUID = oldNewUUID })
+	stubNewUUID(t, pinnedSID)
 
 	if rc := cmdDo([]string{"fresh-task"}); rc != 0 {
 		t.Fatalf("rc=%d", rc)
@@ -159,9 +355,7 @@ func TestCmdDoFreshSpawnFailureRollsBackSessionID(t *testing.T) {
 	seedTask(t, "fail-task")
 
 	const pinnedSID = "ffffffff-aaaa-bbbb-cccc-dddddddddddd"
-	oldNewUUID := newUUID
-	newUUID = func() (string, error) { return pinnedSID, nil }
-	t.Cleanup(func() { newUUID = oldNewUUID })
+	stubNewUUID(t, pinnedSID)
 
 	// Stub iterm.Runner to fail every call — simulates the
 	// Accessibility-denied path on Terminal.app, but works equally
@@ -284,9 +478,7 @@ func TestCmdDoFreshRotatesStaleSession(t *testing.T) {
 	db.Close()
 
 	const pinnedSID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-	oldNewUUID := newUUID
-	newUUID = func() (string, error) { return pinnedSID, nil }
-	t.Cleanup(func() { newUUID = oldNewUUID })
+	stubNewUUID(t, pinnedSID)
 
 	_, getScript := stubITerm(t)
 	if rc := cmdDo([]string{"stale-task", "--fresh"}); rc != 0 {
@@ -596,7 +788,11 @@ func TestCmdDoPropagatesFlowRootEnv(t *testing.T) {
 // tasks.session_id without spawning anything.
 func TestCmdDoHereHappyPath(t *testing.T) {
 	setupFlowRoot(t)
-	seedTask(t, "here-task")
+	seedTaskAtCwd(t, "here-task")
+	// Pretend the jsonl exists at work_dir's encoded path — that
+	// satisfies h.ValidateSession without touching the real
+	// filesystem.
+	stubClaudeStatOK(t)
 	const sid = "f00ba111-2222-4333-8444-555555555555"
 	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
 
@@ -674,7 +870,10 @@ func TestCmdDoHereRejectsAlreadyBound(t *testing.T) {
 // the prior session.
 func TestCmdDoHereForceOverwritesBinding(t *testing.T) {
 	setupFlowRoot(t)
-	seedTask(t, "force-task")
+	// Force-rebind still needs to satisfy the cwd-matches-work_dir
+	// invariant — the new session must have been started at work_dir.
+	seedTaskAtCwd(t, "force-task")
+	stubClaudeStatOK(t)
 
 	const oldSID = "deadbeef-1111-4222-8333-444455556666"
 	const newSID = "f00ba111-2222-4333-8444-555555555555"
@@ -703,7 +902,8 @@ func TestCmdDoHereForceOverwritesBinding(t *testing.T) {
 // no overwrite needed).
 func TestCmdDoHereIdempotent(t *testing.T) {
 	setupFlowRoot(t)
-	seedTask(t, "idem-task")
+	seedTaskAtCwd(t, "idem-task")
+	stubClaudeStatOK(t)
 	const sid = "f00ba111-2222-4333-8444-555555555555"
 	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
 
@@ -777,5 +977,285 @@ func TestCmdDoHereRejectsDoneTask(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
 	if rc := cmdDo([]string{"done-task", "--here"}); rc != 1 {
 		t.Errorf("rc=%d, want 1 (--here on done task should refuse)", rc)
+	}
+}
+
+func TestCmdDoWithFreshInjectsAfterBootstrap(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "with-fresh")
+	_, getScript := stubITerm(t)
+
+	if rc := cmdDo([]string{"with-fresh", "--with", "check upstream PR"}); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	script := getScript()
+	if !strings.Contains(script, "claude --session-id ") {
+		t.Errorf("fresh path should still use --session-id: %s", script)
+	}
+	if !strings.Contains(script, "execution session for flow task with-fresh") {
+		t.Errorf("bootstrap prompt should be intact: %s", script)
+	}
+	if !strings.Contains(script, "[via flow do --with]") {
+		t.Errorf("injected text should carry the marker: %s", script)
+	}
+	if !strings.Contains(script, "check upstream PR") {
+		t.Errorf("injected text body missing: %s", script)
+	}
+	bootstrapIdx := strings.Index(script, "execution session for flow task")
+	markerIdx := strings.Index(script, "[via flow do --with]")
+	if bootstrapIdx == -1 || markerIdx == -1 || markerIdx < bootstrapIdx {
+		t.Errorf("marker must come after bootstrap prompt: %s", script)
+	}
+}
+
+func TestCmdDoWithResumeAppendsPositionalArg(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "with-resume")
+
+	db := openFlowDB(t)
+	if _, err := db.Exec(`UPDATE tasks SET session_id='resume-sid', session_started=? WHERE slug='with-resume'`, flowdb.NowISO()); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	_, getScript := stubITerm(t)
+	if rc := cmdDo([]string{"with-resume", "--with", "ping the user"}); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	script := getScript()
+	if !strings.Contains(script, "claude --resume resume-sid") {
+		t.Errorf("resume path should still emit --resume: %s", script)
+	}
+	if !strings.Contains(script, "[via flow do --with]") {
+		t.Errorf("resume path should carry the marker: %s", script)
+	}
+	if !strings.Contains(script, "ping the user") {
+		t.Errorf("resume path missing injected body: %s", script)
+	}
+}
+
+func TestCmdDoWithFile(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "with-file-task")
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "instr.txt")
+	if err := os.WriteFile(p, []byte("look at the failing tests\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, getScript := stubITerm(t)
+	if rc := cmdDo([]string{"with-file-task", "--with-file", p}); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	script := getScript()
+	if !strings.Contains(script, "[via flow do --with]") {
+		t.Errorf("with-file should carry the marker: %s", script)
+	}
+	abs, _ := filepath.Abs(p)
+	want := "read instructions at " + abs
+	if !strings.Contains(script, want) {
+		t.Errorf("with-file should inject %q (pointer, not contents); got: %s", want, script)
+	}
+	if strings.Contains(script, "look at the failing tests") {
+		t.Errorf("with-file should not embed the file body: %s", script)
+	}
+}
+
+func TestCmdDoWithMutualExclusivity(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "with-mutex")
+	dir := t.TempDir()
+	p := filepath.Join(dir, "instr.txt")
+	if err := os.WriteFile(p, []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	spawns, _ := stubITerm(t)
+	rc := cmdDo([]string{"with-mutex", "--with", "x", "--with-file", p})
+	if rc != 2 {
+		t.Errorf("rc=%d, want 2 for mutex violation", rc)
+	}
+	if atomic.LoadInt64(spawns) != 0 {
+		t.Errorf("mutex violation should not spawn: %d", *spawns)
+	}
+}
+
+func TestCmdDoWithEmptyString(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "with-empty")
+	spawns, _ := stubITerm(t)
+	rc := cmdDo([]string{"with-empty", "--with", "   "})
+	if rc != 2 {
+		t.Errorf("rc=%d, want 2 for empty --with", rc)
+	}
+	if atomic.LoadInt64(spawns) != 0 {
+		t.Errorf("empty --with should not spawn: %d", *spawns)
+	}
+}
+
+func TestCmdDoWithFileMissing(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "with-missing")
+	spawns, _ := stubITerm(t)
+	rc := cmdDo([]string{"with-missing", "--with-file", "/no/such/file/here.txt"})
+	if rc != 1 {
+		t.Errorf("rc=%d, want 1 for missing file", rc)
+	}
+	if atomic.LoadInt64(spawns) != 0 {
+		t.Errorf("missing --with-file should not spawn: %d", *spawns)
+	}
+}
+
+func TestCmdDoWithReopensDoneTask(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "with-done")
+
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET status='done', session_id='done-sid', session_started=?, updated_at=? WHERE slug='with-done'`,
+		flowdb.NowISO(), flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	_, getScript := stubITerm(t)
+	if rc := cmdDo([]string{"with-done", "--with", "are we still blocked?"}); rc != 0 {
+		t.Fatalf("rc=%d, want 0 (--with should auto-reopen done)", rc)
+	}
+
+	db = openFlowDB(t)
+	task, err := flowdb.GetTask(db, "with-done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "in-progress" {
+		t.Errorf("status=%q after --with on done, want in-progress", task.Status)
+	}
+	if task.SessionID.String != "done-sid" {
+		t.Errorf("session_id should be preserved across done->in-progress: got %q", task.SessionID.String)
+	}
+
+	script := getScript()
+	if !strings.Contains(script, "claude --resume done-sid") {
+		t.Errorf("reopen path should resume the existing session: %s", script)
+	}
+	if !strings.Contains(script, "[via flow do --with]") {
+		t.Errorf("reopen path should still inject the instruction: %s", script)
+	}
+}
+
+func TestCmdDoDoneStillRefusedWithoutWith(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "still-done")
+	db := openFlowDB(t)
+	if _, err := db.Exec(`UPDATE tasks SET status='done', session_id='still-done-sid', session_started=?, updated_at=? WHERE slug='still-done'`, flowdb.NowISO(), flowdb.NowISO()); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	spawns, _ := stubITerm(t)
+	if rc := cmdDo([]string{"still-done"}); rc != 1 {
+		t.Errorf("rc=%d, want 1 for done without --with", rc)
+	}
+	if atomic.LoadInt64(spawns) != 0 {
+		t.Errorf("done without --with should not spawn: %d", *spawns)
+	}
+}
+
+func TestCmdDoWithRejectedWithHere(t *testing.T) {
+	setupFlowRoot(t)
+	seedTask(t, "with-here")
+	spawns, _ := stubITerm(t)
+	sid := "abcdef12-3456-4789-8abc-def012345678"
+	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
+	rc := cmdDo([]string{"with-here", "--here", "--with", "do the thing"})
+	if rc != 2 {
+		t.Errorf("rc=%d, want 2 for --with + --here", rc)
+	}
+	if atomic.LoadInt64(spawns) != 0 {
+		t.Errorf("--with + --here should not spawn: %d", *spawns)
+	}
+}
+
+// ---------- cwd-matches-work_dir invariant on flow do --here ----------
+
+// TestCmdDoHereRefusesWhenTranscriptMissing pins the GH #59
+// invariant: --here refuses when the harness's on-disk transcript
+// for (work_dir, sid) isn't where future resumes would look. This
+// is the honest check that catches both naive cwd mismatches AND
+// the chained-cd cheat — comparing os.Getwd() to work_dir would
+// be fooled by `cd <work_dir> && flow do --here task`; statting
+// the jsonl can't be.
+func TestCmdDoHereRefusesWhenTranscriptMissing(t *testing.T) {
+	setupFlowRoot(t)
+	// Even with work_dir == cwd, an absent jsonl must still
+	// refuse — i.e. the cheat doesn't work.
+	seedTaskAtCwd(t, "mismatch-task")
+	stubClaudeStatMissing(t)
+
+	const sid = "11111111-2222-4333-8444-555555555555"
+	t.Setenv("CLAUDE_CODE_SESSION_ID", sid)
+
+	stderr := captureStderr(t)
+	rc := cmdDoHere("mismatch-task", false)
+	if rc != 1 {
+		t.Errorf("cmdDoHere with missing transcript rc=%d, want 1", rc)
+	}
+	got := stderr()
+	for _, want := range []string{
+		"transcript isn't where work_dir says",
+		"flow do mismatch-task",
+		"--work-dir",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stderr missing %q; got:\n%s", want, got)
+		}
+	}
+
+	db := openFlowDB(t)
+	task, err := flowdb.GetTask(db, "mismatch-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.SessionID.Valid {
+		t.Errorf("refused --here should not set session_id; got %+v", task.SessionID)
+	}
+	if task.Status != "backlog" {
+		t.Errorf("refused --here should not flip status; got %q", task.Status)
+	}
+}
+
+// TestCmdDoHereForceDoesNotBypassCwdGate pins that --force does NOT
+// override the cwd-mismatch invariant: --force overrides the
+// already-bound-elsewhere check but the cwd check must still hold,
+// because passing it would create a fresh invariant violation
+// (work_dir != cwd-of-session). The user fix is to cd or update
+// work_dir first.
+func TestCmdDoHereForceDoesNotBypassCwdGate(t *testing.T) {
+	setupFlowRoot(t)
+	seedTaskAtCwd(t, "force-mismatch")
+	stubClaudeStatMissing(t)
+
+	const oldSID = "deadbeef-1111-4222-8333-444455556666"
+	const newSID = "f00ba111-2222-4333-8444-555555555555"
+	db := openFlowDB(t)
+	if _, err := db.Exec(
+		`UPDATE tasks SET session_id=?, session_started=?, status='in-progress' WHERE slug='force-mismatch'`,
+		oldSID, flowdb.NowISO(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	t.Setenv("CLAUDE_CODE_SESSION_ID", newSID)
+	if rc := cmdDoHere("force-mismatch", true); rc != 1 {
+		t.Errorf("cmdDoHere --force with cwd mismatch rc=%d, want 1", rc)
+	}
+
+	db = openFlowDB(t)
+	task, _ := flowdb.GetTask(db, "force-mismatch")
+	if task.SessionID.String != oldSID {
+		t.Errorf("session_id should be untouched; got %q want %s", task.SessionID.String, oldSID)
 	}
 }

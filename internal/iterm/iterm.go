@@ -4,11 +4,12 @@ package iterm
 import (
 	"fmt"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 )
 
-// Runner is the function used to execute osascript.
+// Runner is the function used to execute osascript for SpawnTab.
 // Tests override this to capture arguments without invoking osascript.
 var Runner = func(args []string) error {
 	cmd := exec.Command("osascript", args...)
@@ -17,6 +18,21 @@ var Runner = func(args []string) error {
 		return fmt.Errorf("osascript failed: %v: %s", err, string(out))
 	}
 	return nil
+}
+
+// RunnerOutput is the function used to execute osascript when the
+// caller needs to read stdout (e.g., FocusSession needs to know
+// whether a match was found). Separate from Runner so tests can mock
+// it independently and existing SpawnTab tests stay untouched.
+var RunnerOutput = func(args []string) ([]byte, error) {
+	return exec.Command("osascript", args...).Output()
+}
+
+// PSRunner returns the output of `ps -axo pid,tty,command`. Overridable
+// for tests. Includes tty so FocusSession can map a harness PID → tty
+// → iTerm2 session in one pass.
+var PSRunner = func() ([]byte, error) {
+	return exec.Command("ps", "-axo", "pid,tty,command").Output()
 }
 
 // SpawnTab opens a new iTerm2 tab with the given title, cwd, and command.
@@ -43,22 +59,134 @@ func SpawnTab(title, cwd, command string, envVars map[string]string) error {
 		}
 		envPrefix = strings.Join(parts, " ") + " "
 	}
-	fullCommand := fmt.Sprintf(" cd %s && %s%s", ShellQuote(cwd), envPrefix, command)
-	safeCommand := escapeAppleScriptString(fullCommand)
-	safeTitle := escapeAppleScriptString(title)
+	// Raise the file descriptor limit before launching `claude`. macOS
+	// gives shells a default soft limit of 256, which trips Claude under
+	// heavy tool use ("possibly due to low max file descriptors"). Some
+	// terminal apps (Warp) raise it on their own; iTerm does not.
+	fullCommand := fmt.Sprintf(" cd %s && ulimit -n 65536 && %s%s", ShellQuote(cwd), envPrefix, command)
+	safeCommand := quoteAppleScriptString(fullCommand)
+	safeTitle := quoteAppleScriptString(title)
 
-	script := fmt.Sprintf(`tell application "iTerm2"
+	script := fmt.Sprintf(`tell application "iTerm"
+  activate
+  if (count of windows) is 0 then
+    create window with default profile
+  end if
   tell current window
     set newTab to (create tab with default profile)
     tell current session of newTab
-      set name to "%s"
-      write text "%s"
+      set name to %s
+      write text %s
     end tell
   end tell
 end tell
 `, safeTitle, safeCommand)
 
 	return Runner([]string{"-e", script})
+}
+
+// FocusSession tries to focus the iTerm2 session whose underlying
+// process is `binary` running with `--session-id <sessionID>` or
+// `--resume <sessionID>` (or any flag carrying the UUID). The
+// `binary` arg is the harness's executable name (e.g. "claude",
+// "codex", "gemini") used to filter ps rows. Returns (true, nil) on
+// focus, (false, nil) if no matching tab was found in iTerm2, and
+// (false, err) only on a backend (ps / osascript) failure.
+//
+// Mechanism: scan `ps -axo pid,tty,command` for a row mentioning the
+// harness binary whose argv contains the session UUID, extract its
+// controlling tty, then drive osascript to walk every window/tab/
+// session and select the one whose `tty` property matches.
+func FocusSession(sessionID, binary string) (bool, error) {
+	if sessionID == "" {
+		return false, nil
+	}
+	tty, err := ttyForHarnessSession(sessionID, binary)
+	if err != nil {
+		return false, err
+	}
+	if tty == "" {
+		return false, nil
+	}
+	return focusByTTY(tty)
+}
+
+// sessionUUIDRowRe matches a `ps` line carrying a session UUID via
+// `--session-id <uuid>` or `--resume <uuid>`. Paired with a binary-
+// name check by ttyForHarnessSession to filter rows down to the
+// caller's harness only.
+var sessionUUIDRowRe = regexp.MustCompile(
+	`(?:--session-id|--resume)[ =]([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})`,
+)
+
+// ttyForHarnessSession returns the controlling tty (e.g.,
+// "/dev/ttys012") of the process matching `binary` and carrying the
+// given session UUID in its argv, or "" if no such process exists.
+func ttyForHarnessSession(sessionID, binary string) (string, error) {
+	out, err := PSRunner()
+	if err != nil {
+		return "", fmt.Errorf("ps: %w", err)
+	}
+	needle := strings.ToLower(sessionID)
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, binary) {
+			continue
+		}
+		matches := sessionUUIDRowRe.FindStringSubmatch(line)
+		if len(matches) < 2 {
+			continue
+		}
+		if strings.ToLower(matches[1]) != needle {
+			continue
+		}
+		// `ps -axo pid,tty,command` columns: pid, tty, command.
+		// After Fields() splits on whitespace, fields[1] is the tty
+		// (e.g., "ttys012", or "??" for no controlling terminal).
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		tty := fields[1]
+		if tty == "??" || tty == "?" || tty == "" {
+			continue
+		}
+		if !strings.HasPrefix(tty, "/dev/") {
+			tty = "/dev/" + tty
+		}
+		return tty, nil
+	}
+	return "", nil
+}
+
+// focusByTTY drives iTerm2's AppleScript dictionary to find a session
+// whose `tty` property matches and select it (and its enclosing tab
+// and window). The script writes "ok" to stdout on match, "miss"
+// otherwise; we distinguish at the Go level instead of relying on
+// osascript's exit code.
+func focusByTTY(tty string) (bool, error) {
+	safeTTY := escapeAppleScriptString(tty)
+	script := fmt.Sprintf(`tell application "iTerm2"
+  activate
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if tty of s is "%s" then
+          select w
+          tell t to select
+          tell s to select
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end repeat
+  return "miss"
+end tell
+`, safeTTY)
+	out, err := RunnerOutput([]string{"-e", script})
+	if err != nil {
+		return false, fmt.Errorf("osascript: %w", err)
+	}
+	return strings.TrimSpace(string(out)) == "ok", nil
 }
 
 // ShellQuote wraps s in single quotes with proper escaping.
@@ -70,4 +198,27 @@ func escapeAppleScriptString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
 	return s
+}
+
+// quoteAppleScriptString returns an AppleScript expression that evaluates
+// to s. Lines are emitted as separate quoted strings joined with
+// `& linefeed &`, because AppleScript double-quoted strings cannot
+// contain literal newlines and there are no \n escape sequences inside
+// the quotes. Tabs are similarly handled with `& tab &`.
+func quoteAppleScriptString(s string) string {
+	// Split on newlines; for each line, also split on tabs.
+	lines := strings.Split(s, "\n")
+	parts := make([]string, 0, len(lines))
+	for i, line := range lines {
+		// Split each line on tabs, escape pieces, join with `& tab &`.
+		segs := strings.Split(line, "\t")
+		quoted := make([]string, len(segs))
+		for j, seg := range segs {
+			quoted[j] = `"` + escapeAppleScriptString(seg) + `"`
+		}
+		joined := strings.Join(quoted, " & tab & ")
+		parts = append(parts, joined)
+		_ = i
+	}
+	return strings.Join(parts, " & linefeed & ")
 }

@@ -2,11 +2,65 @@ package app
 
 import (
 	"flow/internal/flowdb"
+	"flow/internal/harness/claude"
 	"flow/internal/iterm"
+	"flow/internal/spawner"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// TestStatsE2E exercises `flow stats` against a real (but temp) flow root:
+// empty stats succeed, --card writes a file, and a garbage --since value
+// returns exit code 2.
+func TestStatsE2E(t *testing.T) {
+	tmp := t.TempDir()
+	flowRoot := filepath.Join(tmp, "flow")
+	t.Setenv("FLOW_ROOT", flowRoot)
+	t.Setenv("HOME", tmp)
+
+	// Mirror the same stubs as TestE2EFullRoundtrip so cmdInit doesn't try
+	// to touch real ~/.claude or run osascript.
+	oldOverride := spawner.Override
+	spawner.Override = spawner.BackendITerm
+	t.Cleanup(func() { spawner.Override = oldOverride })
+
+	oldOsa := iterm.Runner
+	iterm.Runner = func(args []string) error { return nil }
+	t.Cleanup(func() { iterm.Runner = oldOsa })
+
+	oldClaude := claude.SkipPermissionsRunner
+	claude.SkipPermissionsRunner = func(prompt string) error { return nil }
+	t.Cleanup(func() { claude.SkipPermissionsRunner = oldClaude })
+
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) { return "stats-e2e-uuid", nil }
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
+
+	// init — creates the tree, db, and skill files.
+	if rc := cmdInit(nil); rc != 0 {
+		t.Fatalf("init rc=%d", rc)
+	}
+
+	// stats on an empty-but-initialized root must succeed (all zeros, no panic).
+	if rc := cmdStats(nil); rc != 0 {
+		t.Fatalf("stats rc=%d, want 0", rc)
+	}
+
+	// --card writes a file and exits 0.
+	card := filepath.Join(flowRoot, "card.html")
+	if rc := cmdStats([]string{"--card", "--out", card}); rc != 0 {
+		t.Fatalf("stats --card rc=%d, want 0", rc)
+	}
+	if _, err := os.Stat(card); err != nil {
+		t.Fatalf("card not written: %v", err)
+	}
+
+	// A garbage --since value is a usage error (rc=2).
+	if rc := cmdStats([]string{"--since", "garbage"}); rc != 2 {
+		t.Fatalf("bad --since rc=%d, want 2", rc)
+	}
+}
 
 // TestE2EFullRoundtrip exercises the full command surface in the order a
 // user would hit it for a realistic session: init, add project, add task
@@ -29,6 +83,14 @@ func TestE2EFullRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Pin the spawner backend so a kitty/zellij/Terminal.app host does
+	// not route SpawnTab to a real terminal CLI. Without this, running
+	// the test inside kitty (KITTY_WINDOW_ID set) opens a real tab and
+	// types the fixture command into the user's shell.
+	oldOverride := spawner.Override
+	spawner.Override = spawner.BackendITerm
+	t.Cleanup(func() { spawner.Override = oldOverride })
+
 	// Stub osascript for the whole test.
 	oldOsa := iterm.Runner
 	iterm.Runner = func(args []string) error { return nil }
@@ -36,18 +98,19 @@ func TestE2EFullRoundtrip(t *testing.T) {
 
 	// Stub the headless claude runner so cmdDone doesn't try to invoke
 	// the real claude CLI for its post-flip KB sweep.
-	oldClaude := claudeRunner
-	claudeRunner = func(slug, prompt string) error { return nil }
-	t.Cleanup(func() { claudeRunner = oldClaude })
+	oldClaude := claude.SkipPermissionsRunner
+	claude.SkipPermissionsRunner = func(prompt string) error { return nil }
+	t.Cleanup(func() { claude.SkipPermissionsRunner = oldClaude })
 
 	// Pin the UUID `flow do` allocates so downstream assertions can
-	// reference a known session_id. In production, newUUID produces a
-	// random v4 UUID that is also written to tasks.session_id before
-	// the iTerm tab spawns and passed to `claude --session-id`.
+	// reference a known session_id. In production this minted a random
+	// v4 UUID written to tasks.session_id before the iTerm tab spawns
+	// and passed to `claude --session-id`. Pinning lets us check that
+	// known id survived end to end.
 	const fixedSID = "e2e-session-uuid"
-	oldNewUUID := newUUID
-	newUUID = func() (string, error) { return fixedSID, nil }
-	t.Cleanup(func() { newUUID = oldNewUUID })
+	oldNewUUID := claude.NewUUID
+	claude.NewUUID = func() (string, error) { return fixedSID, nil }
+	t.Cleanup(func() { claude.NewUUID = oldNewUUID })
 
 	step := func(name string, rc int) {
 		t.Helper()
@@ -109,7 +172,7 @@ func TestE2EFullRoundtrip(t *testing.T) {
 	// 5b. Write real jsonl content at the path claude would have used
 	// given our pre-allocated session_id, so transcript can parse it.
 	{
-		encoded := EncodeCwdForClaude(task.WorkDir)
+		encoded := claude.EncodeCwd(task.WorkDir)
 		sessionDir := filepath.Join(tmp, ".claude", "projects", encoded)
 		if err := os.MkdirAll(sessionDir, 0o755); err != nil {
 			t.Fatal(err)

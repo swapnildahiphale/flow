@@ -10,3 +10,6 @@
 
 # Personal Claude Code settings — model pin, per-user overrides.
 /.claude/settings.local.json
+
+# git worktrees for isolated feature work
+/.worktrees/

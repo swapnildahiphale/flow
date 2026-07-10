@@ -340,53 +340,6 @@ func TestSpawnTabWrapsAccessibilityError(t *testing.T) {
 	}
 }
 
-// TestSpawnTabWrapsAppNotFoundError_OpenURL — when OpenURL returns a
-// Launch-Services-not-found error, the returned error names Warp and
-// links to https://warp.dev.
-func TestSpawnTabWrapsAppNotFoundError_OpenURL(t *testing.T) {
-	cases := []string{
-		"open warp://... failed: LSApplicationNotFoundErr (-10814)",
-		"open failed: no application knows how to open URL warp://action/new_tab",
-	}
-	for _, msg := range cases {
-		t.Run(msg, func(t *testing.T) {
-			s := newWarpStubs(t)
-			s.openErr = errors.New(msg)
-
-			err := SpawnTab("t", "/tmp", "echo hi", nil)
-			if err == nil {
-				t.Fatal("expected error, got nil")
-			}
-			es := err.Error()
-			for _, want := range []string{
-				"Warp doesn't appear to be installed",
-				"https://warp.dev",
-			} {
-				if !strings.Contains(es, want) {
-					t.Errorf("wrapped error missing %q:\n%s", want, es)
-				}
-			}
-		})
-	}
-}
-
-// TestSpawnTabWrapsAppNotFoundError_Runner — Runner can also surface
-// the not-found pattern (AppleScript `application id` lookup misses
-// when Warp isn't installed).
-func TestSpawnTabWrapsAppNotFoundError_Runner(t *testing.T) {
-	s := newWarpStubs(t)
-	s.runnerErr = errors.New(`osascript failed: exit status 1: Can't get application id "dev.warp.Warp-Stable". (-1728)`)
-
-	err := SpawnTab("t", "/tmp", "echo hi", nil)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	es := err.Error()
-	if !strings.Contains(es, "Warp doesn't appear to be installed") {
-		t.Errorf("wrapped error missing install hint:\n%s", es)
-	}
-}
-
 // TestShellQuote — same contract as iterm.ShellQuote / terminal.ShellQuote
 // / zellij.ShellQuote.
 func TestShellQuote(t *testing.T) {

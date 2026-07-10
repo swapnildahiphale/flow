@@ -7,31 +7,340 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-alpha.24] — 2026-07-06
+
 ### Added
 
-- **Warp as a first-class spawn backend.** `flow do` opens new tabs in
-  Warp when invoked from a Warp shell (`TERM_PROGRAM=WarpTerminal`).
-  Selection priority is now `$ZELLIJ` → `$FLOW_TERM` → `WarpTerminal`
-  / `Apple_Terminal` / `iTerm.app` → iTerm-default. Warp has no
-  AppleScript dictionary, no `-e` flag, and no command-running CLI —
-  so the backend opens a tab via `warp://action/new_tab?path=<cwd>`
-  and delivers the bootstrap by keystroking the path to a
-  self-deleting `/var/folders/.../flow-warp-<uuid>.sh` script via
-  osascript. Submission uses `keystroke (ASCII character 13)` rather
-  than `key code 36` / `keystroke return` because Warp v0.2026.04
-  filters synthetic Return-key events for ~2s after typed input;
-  pushing the CR through as a typed character flows through to the
-  shell PTY before the UI-layer filter can fire. Requires macOS
-  Accessibility for Warp (same gate as the Terminal.app backend).
-  Friendly errors when Warp isn't installed (`LSApplicationNotFoundErr`)
-  or when Accessibility isn't granted, pointing at the right System
-  Settings pane.
-- **`FLOW_TERM` env override.** Set `FLOW_TERM=warp|iterm|terminal|zellij`
-  to force a specific spawn backend regardless of `$TERM_PROGRAM`.
-  Useful when running flow from a non-standard host (tmux inside Warp,
-  shell scripts, Hyper, wezterm). `$ZELLIJ` still wins — if you're
-  inside a zellij session, that's where new tabs go. Unrecognized
-  values silently fall through to `$TERM_PROGRAM` detection.
+- **UserPromptSubmit hook — bound-session drift/close-out anchor.** In a
+  Claude session bound to a flow task, `flow hook user-prompt-submit`
+  injects a tiny (~45-token) per-prompt anchor naming the task and
+  re-running the skill's lifecycle-transition checks: if the prompt is
+  unrelated work it offers a new task (§4.11), and if the prompt signals
+  the task is finished it offers to close it out (§4.7). Unbound sessions
+  are a pure no-op. This is distinct from — and not a revival of — the
+  per-prompt *unbound* skill nudge retired in v0.1.0-alpha.7: that one
+  duplicated the SessionStart hint, whereas drift and close-out are
+  per-prompt signals SessionStart structurally cannot catch. Both
+  `flow skill install` and the auto-upgrade path now install the hook
+  (leaving any unrelated user-defined hooks in the same event untouched).
+
+## [0.1.0-alpha.22] — 2026-06-24
+
+### Added
+
+- **`flow stats` — local usage & ROI analytics.** A new read-only command
+  that mines your own flow history (harness session transcripts, the task
+  DB, and the on-disk KB/updates) to show how much context flow has
+  re-established for you without re-typing: context recalls broken down by
+  kind (resume · reference · cross-task · kb), tokens processed, tasks
+  shipped, KB facts, automation runs, and estimated time/$ saved. Ground-
+  truth counts are exact; time/token figures are estimates.
+  - `flow stats` (all-time terminal report); `--since all|<N>d|RFC3339`
+    (window); `--project <slug>` (scope to one project).
+  - **Shareable cards.** `flow stats --card` writes a flow-branded HTML
+    card; `flow stats --png` renders the same card to a self-contained PNG
+    with no browser or runtime dependency (pure-Go drawing via
+    `fogleman/gg` + embedded fonts; CGO stays off — costs ~+1.27MB binary).
+    The PNG card is flow-branded — embedded wordmark logo, gradient hero
+    number, dark palette. `--out <path>` overrides the default
+    `<flow-root>/stats-card.{html,png}`.
+  - **Estimates are tunable and grounded.** Savings figures derive from an
+    optional `~/.flow/stats.json` (built-in defaults apply when absent, so
+    create it only to override); context-token savings are file-size-
+    grounded. A derived `~/.flow/stats-cache.json` (keyed by mtime+size)
+    keeps re-scans cheap — safe to delete; gitignore it if you track
+    `~/.flow` in git.
+
+## [0.1.0-alpha.21] — 2026-06-11
+
+### Added
+
+- **Owners — autonomous, self-prompting controllers (`flow owner`).** A new
+  durable primitive that takes ongoing responsibility for an outcome:
+  re-wakes on its own, re-evaluates, and acts until done — vs. the one-shot
+  `flow do --auto`. An owner is **not** a long-running session; it is state
+  (a `charter.md` operating manual + a journal + a clock). Each tick is a
+  *fresh headless run* that reads its charter and journal, **orchestrates**
+  (routes work through tasks/playbook-runs that self-close with the
+  `flow done` KB sweep — it never executes work inline), parks human
+  decisions as `question`-tagged tasks, **self-paces** its next wake, and
+  journals. Cheaper and more durable than keeping a mind alive between
+  events.
+  - Commands: `flow add owner "<name>" --work-dir <p> [--every <dur>]
+    [--slug] [--project] [--mkdir]`; `flow owner list | show <slug> |
+    start | pause | tick [--auto] | next (--in|--at) | retire [--delete]`.
+    `list`/`show` also as verb-first aliases `flow list owners` /
+    `flow show owner <slug>`.
+  - **Tags, not new tables** — owner↔task linkage and the human-question
+    marker reuse the tag system (`owner:<slug>`, `question`);
+    `flow add task --tag` and `flow list tasks --tag` are now repeatable
+    (intersection).
+  - **Self-paced scheduling** — each tick sets its own next wake; `--every`
+    is a fallback heartbeat floor (default 24h). Overdue ticks (e.g. after
+    the laptop sleeps) fire once on wake, never stack.
+  - **Event-driven owners (advanced)** — for a bounded reactive window a
+    tick can dispatch a watcher task (Monitor tool) that fires a focused
+    `flow owner tick --auto` on an event, then exits; the manual `--auto`
+    tick is overlap-guarded.
+  - **No daemon / no OS-specific scheduler code** — flow ships only
+    `flow owner tick-due`; the recurring heartbeat is a launchd (or
+    systemd/cron) agent the flow skill sets up once per host.
+  - Live tick indicator (`tick_pid`/`tick_started`) with overlap guard,
+    dead-/stale-pid reconciliation, and targeted-column writes that commute
+    across the scheduler and the detached tick (no lost updates).
+
+## [0.1.0-alpha.20] — 2026-06-10
+
+### Fixed
+
+- **`$FLOW_TERM=bg` spawn could fail to capture the session id.** The
+  `claude agents --json --all` lookup that resolves a freshly-spawned bg
+  session's id had a 5s timeout, but immediately after `claude --bg` the
+  daemon is busy registering the new agent and the query routinely takes
+  ~10s — so the spawn errored (`signal: killed`) and rolled back, leaving
+  an orphaned agent. The backstop timeout is now 30s (it only guards
+  against a genuinely stalled daemon, not normal post-spawn latency).
+  Fixes bg spawn introduced in alpha.19.
+
+## [0.1.0-alpha.19] — 2026-06-10
+
+### Added
+
+- **Terminal-free background-agent spawn backend (`$FLOW_TERM=bg`).** Set
+  `FLOW_TERM=bg` and `flow do <task>` launches the session as a Claude Code
+  **background agent** (Agent View, `claude agents`) instead of opening a
+  terminal tab — for users who live in the Agent View. flow spawns
+  `claude --bg --name "<project>/<task>" <prompt>` (in the task's
+  `work_dir`), parses the launch banner, and resolves the **real**
+  session id via a single `claude agents --json --all` lookup — so a
+  `--bg`-injecting `claude` alias no longer defeats flow's session-id
+  binding (flow captures the harness-minted id instead of recording a
+  phantom one). Re-running is idempotent: a still-live session is reported
+  as open in the Agent View; a not-running or removed one is brought back
+  via `claude --bg --resume` (which inherits the prior conversation under
+  a new id, so flow re-records it). `flow show` / `flow list` surface live
+  bg status (and `flow transcript` resolves a bg session's jsonl by
+  globbing the session id, handling the git-worktree relocation case).
+  Background mode is Claude-only; pointing `FLOW_TERM=bg` at a task pinned
+  to another harness fails cleanly rather than silently opening a tab.
+
+## [0.1.0-alpha.18] — 2026-06-08
+
+### Added
+
+- **`flow do --auto` / `flow run playbook --auto` — autonomous, headless
+  background runs.** Instead of opening a terminal tab for a human to
+  drive, `--auto` launches a detached supervisor (`flow __auto-exec`,
+  hidden) that runs the task's harness headlessly — pinned to the
+  pre-allocated session id, cwd at `work_dir`, stdout/stderr captured to
+  `tasks/<slug>/auto-runs/<timestamp>.log` — and returns immediately. The
+  session works end to end on best judgment (no `AskUserQuestion`,
+  persisting toward a closeable state rather than giving up early) and
+  calls `flow done` on **itself** when the brief's *Done when* is met,
+  which still fires the close-out KB/project sweep. `--auto` implies
+  `--dangerously-skip-permissions` (no human to approve tool calls) and
+  accepts `--with` / `--with-file` for a one-off directive layered on the
+  brief; `--auto` + `--here` is rejected. The headless-with-session-id
+  invocation is a third harness execution shape, added to the harness
+  interface as `AutoRunArgv` — claude implements it; codex/gemini inherit
+  auto mode by implementing the one method. A per-run status —
+  `running → completed | dead`, with read-time pid reconciliation so a
+  crashed supervisor surfaces as `dead` — shows in `flow show task` and a
+  dedicated `AUTO` column in `flow list tasks` (a running row shows the
+  pid). New nullable `tasks` columns: `auto_run_status`, `auto_run_pid`,
+  `auto_run_started`, `auto_run_finished`, `auto_run_log` (additive
+  migration). Non-blocking hardening follow-ups are tracked in
+  [#68](https://github.com/Facets-cloud/flow/issues/68).
+  ([#67](https://github.com/Facets-cloud/flow/pull/67) by
+  [@anshulsao](https://github.com/anshulsao))
+
+### Changed
+
+- **Hardened iTerm2 tab spawning.** Raises the file-descriptor `ulimit`
+  before spawning and uses more robust AppleScript quoting, preventing
+  tab-spawn failures under constrained descriptor limits or when the
+  command contains characters that tripped the previous quoting.
+  ([#64](https://github.com/Facets-cloud/flow/pull/64) by
+  [@ishaankalra](https://github.com/ishaankalra))
+
+## [0.1.0-alpha.17] — 2026-05-29
+
+### Fixed
+
+- **`flow transcript` elided pre-bind work on retrospective `--here`
+  binds, silently starving the close-out KB sweep.** `flow transcript`
+  filtered out every jsonl entry before `tasks.session_started`, on the
+  assumption that `session_started` ≈ the conversation's start. That
+  holds for `flow do` spawns (the UUID is pre-allocated, so the first
+  message lands just after `session_started`) but breaks for a
+  retrospective `flow do --here` bind: there `session_started` is
+  stamped at *bind time*, after all the real work. The cutoff then
+  dropped the entire conversation, so the `flow done` close-out sweep
+  mined an empty tail and wrote nothing to the KB — silent knowledge
+  loss. Hit live on 2026-05-29 (task `cp-mgmt-skill`), whose whole
+  session had to be hand-distilled into the KB. The fix removes the
+  time cutoff entirely: `flow transcript` (and therefore the sweep)
+  now always renders the full session. An over-inclusive sweep was
+  already the documented preference over silent data loss; the
+  dispatch-chatter-stripping the cutoff bought for early binds was
+  deemed not worth the failure mode. `RenderTranscript`'s `cutoff`
+  parameter is gone from the harness interface.
+  ([#65](https://github.com/Facets-cloud/flow/pull/65) by
+  [@rr0hit](https://github.com/rr0hit))
+
+## [0.1.0-alpha.16] — 2026-05-28
+
+### Fixed
+
+- **Migration silently drops `tasks.harness` on older DBs.** The
+  session-invariant table rebuild in `migrateTasksSessionInvariant`
+  hardcoded `tasks_new`'s DDL and omitted the `harness` column added
+  one statement earlier in the same `runMigrations` pass. DBs
+  upgrading from a version that predated the rebuild (e.g.
+  `v0.1.0-alpha.4` → `v0.1.0-alpha.15`) had `harness` added by
+  `ALTER TABLE` and then silently dropped by the rebuild that
+  recreates `tasks` without listing it. Symptom: every subsequent
+  `SELECT` using `TaskCols` errored with `no such column: harness`,
+  making `flow list tasks` and most other commands unusable after
+  upgrading to alpha.15. Fix adds `harness TEXT` to `tasks_new`'s
+  DDL and to both column lists in `INSERT INTO tasks_new (...)
+  SELECT ... FROM tasks`. Users who already hit the bug recover
+  automatically on next upgrade: `columnExists` re-runs the
+  `ALTER`, and the rebuild's idempotency guard
+  (`strings.Contains(ddl, "session_id IS NOT NULL")`) short-circuits
+  because the broken table already carries the CHECK. No data loss
+  in either direction — `harness` is nullable with `NULL` = "claude"
+  back-compat.
+  ([#63](https://github.com/Facets-cloud/flow/pull/63) by
+  [@rr0hit](https://github.com/rr0hit))
+
+## [0.1.0-alpha.15] — 2026-05-27
+
+### Added
+
+- **GitHub Pages site.** A static one-page site at
+  `https://facets-cloud.github.io/flow/` introducing flow at a glance:
+  dark terminal-aesthetic hero, brief-styled (What / Why / Done-when)
+  feature sections, four-act demo embedded as MP4 video with poster
+  + reduced-motion fallback, inline-SVG diagrams from the README, and
+  a one-shot install block. Pure HTML/CSS/vanilla JS, zero build step,
+  ~50 KB above the fold. CI workflow (`.github/workflows/pages.yml`)
+  force-pushes `site/**` + `docs/demo/**` to a `gh-pages` orphan
+  branch on every push to main. **One-time setup after upgrade:**
+  Repo Settings → Pages → Source = "Deploy from a branch", Branch =
+  `gh-pages` / `/(root)`.
+  ([#60](https://github.com/Facets-cloud/flow/pull/60) by
+  [@pramodh-ayyappan](https://github.com/pramodh-ayyappan))
+- **Pluggable agent harnesses.** Internal refactor that moves
+  Claude-specific code behind a 14-method `internal/harness`
+  interface, with codex/gemini adapters ready to drop in as one
+  line each in `allHarnesses()`. Adds `tasks.harness` (per-task
+  adapter pinning; NULL = claude for back-compat) and
+  `tasks.session_cwd` (fixes a pre-existing `flow transcript`
+  not-found for `--here`-bound sessions started in a directory ≠
+  `task.work_dir`; session identity is now keyed on
+  `(cwd, session_id)` to match claude's on-disk layout). Ambient
+  harness detection probes `$CLAUDE_CODE_SESSION_ID` /
+  `$CODEX_THREAD_ID` / `$GEMINI_SESSION_ID`; defaults to claude.
+  `flow do --here --force` on a task pinned to a different harness
+  switches the pinning alongside the session rebind, with a
+  warning that the prior transcript is orphaned. Schema changes
+  are additive and nullable — no backfill, no behavior change for
+  existing rows.
+  ([#58](https://github.com/Facets-cloud/flow/pull/58) by
+  [@rr0hit](https://github.com/rr0hit))
+- **Focus existing tab on `flow do`.** When the task's `session_id`
+  is already running, `flow do <task>` switches to the existing tab
+  instead of erroring with the "use `--force`" message. Implemented
+  via `spawner.FocusSession` with per-backend implementations across
+  iTerm2, Terminal.app, and zellij — each maps the running claude
+  PID back to a tab/pane and selects it. Exits 0 with `Already open:
+  <slug> — switched to existing tab` on focus; preserves the old
+  error on focus miss so `--force` semantics are unchanged. Warns on
+  stderr when more than one claude process is detected for the same
+  UUID (prior `--force`, or a manual `claude --resume`).
+  ([#28](https://github.com/Facets-cloud/flow/pull/28) by
+  [@pa](https://github.com/pa))
+
+### Changed
+
+- **README — Claude shell aliases.** New "Optional: Claude shell
+  aliases" subsection in Install with two aliases: `claude` →
+  `claude --dangerously-skip-permissions --bg` (skip per-tool prompts,
+  run in background) and `ca` → `command claude agents` (Claude
+  agents-mode shortcut; `command` bypasses the first alias so the
+  `agents` subcommand sees a clean argv). Source two lines to enable
+  agents mode without typing the flag each time.
+  ([#57](https://github.com/Facets-cloud/flow/pull/57) by
+  [@rr0hit](https://github.com/rr0hit))
+
+## [0.1.0-alpha.14] — 2026-05-18
+
+### Added
+
+- **`flow do --with` / `--with-file`.** Inject a one-shot instruction
+  as the resumed/started session's first user message (prefixed with
+  `[via flow do --with]` so the model can distinguish injected from
+  typed input). `--with-file <path>` points the session at a file
+  (`read instructions at <abs-path>`) instead of embedding contents —
+  no size limits. `--with` on a `done` task auto-rolls it back to
+  in-progress. Rejected in combination with `--here` (no spawned
+  session to inject into). `flow run playbook <slug>` accepts the same
+  flags. The lane for nudging parked tasks and feeding ad-hoc
+  instructions to scheduled playbook runs without opening the tab.
+  ([#50](https://github.com/Facets-cloud/flow/pull/50) by
+  [@anshulsao](https://github.com/anshulsao))
+- **kitty as a first-class spawn backend.** `flow do` opens new tabs
+  in kitty via `kitty @ launch --type tab` when invoked from a kitty
+  shell. Requires `allow_remote_control yes` in kitty config.
+  ([#37](https://github.com/Facets-cloud/flow/pull/37) by
+  [@unni-facets](https://github.com/unni-facets))
+- **Warp as a first-class spawn backend.** `flow do` opens new tabs
+  in Warp when invoked from a Warp shell (`TERM_PROGRAM=WarpTerminal`).
+  Uses `warp://action/new_tab` to open the tab and osascript to
+  keystroke a self-deleting bootstrap script, since Warp has no
+  AppleScript dictionary or command-running CLI. Requires macOS
+  Accessibility for Warp.
+  ([#46](https://github.com/Facets-cloud/flow/pull/46) by
+  [@swapnildahiphale](https://github.com/swapnildahiphale))
+- **Ghostty as a first-class spawn backend.** `flow do` opens new
+  tabs in Ghostty when invoked from a Ghostty shell.
+  ([#53](https://github.com/Facets-cloud/flow/pull/53) by
+  [@cyphernext](https://github.com/cyphernext))
+- **`FLOW_TERM` env override.** Set
+  `FLOW_TERM=warp|iterm|terminal|zellij|kitty|ghostty` to force a
+  specific spawn backend regardless of `$TERM_PROGRAM`. `$ZELLIJ`
+  still wins; unrecognized values fall through to `$TERM_PROGRAM`
+  detection.
+  ([#46](https://github.com/Facets-cloud/flow/pull/46))
+- **`flow run playbook --here`.** Bind THIS Claude session to a
+  playbook-run task without spawning a new tab — mirrors `flow do
+  --here` for run-tasks. Includes a close-out sweep refactor.
+  ([#48](https://github.com/Facets-cloud/flow/pull/48) by
+  [@vishnukv-facets](https://github.com/vishnukv-facets))
+
+### Changed
+
+- **`flow list` rendering.** Tabwriter-aligned columns,
+  `--format json|tsv` for machine-readable output, ANSI color when
+  stdout is a TTY.
+  ([#44](https://github.com/Facets-cloud/flow/pull/44) by
+  [@unni-facets](https://github.com/unni-facets))
+- **README wordmark logo.** Theme-aware SVG logo at the top of
+  the README.
+  ([#35](https://github.com/Facets-cloud/flow/pull/35) by
+  [@pa](https://github.com/pa))
+
+### Fixed
+
+- **flowdb concurrent-open race.** `busy_timeout` is now applied at
+  `OpenDB` time so concurrent opens don't race the pragma.
+  ([#36](https://github.com/Facets-cloud/flow/pull/36) by
+  [@pa](https://github.com/pa))
+- **e2e spawner override leak.** Pin `spawner.Override` in the e2e
+  test so a real kitty tab isn't spawned during CI.
+  ([#42](https://github.com/Facets-cloud/flow/pull/42) by
+  [@unni-facets](https://github.com/unni-facets))
 
 ## [0.1.0-alpha.8] — 2026-05-09
 
@@ -160,7 +469,15 @@ Initial public release.
   against `macos-latest` and `ubuntu-latest`.
 - **License.** MIT.
 
-[Unreleased]: https://github.com/Facets-cloud/flow/compare/v0.1.0-alpha.8...HEAD
+[Unreleased]: https://github.com/Facets-cloud/flow/compare/v0.1.0-alpha.24...HEAD
+[0.1.0-alpha.24]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.24
+[0.1.0-alpha.20]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.20
+[0.1.0-alpha.19]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.19
+[0.1.0-alpha.18]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.18
+[0.1.0-alpha.17]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.17
+[0.1.0-alpha.16]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.16
+[0.1.0-alpha.15]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.15
+[0.1.0-alpha.14]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.14
 [0.1.0-alpha.8]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.8
 [0.1.0-alpha.7]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.7
 [0.1.0-alpha.6]: https://github.com/Facets-cloud/flow/releases/tag/v0.1.0-alpha.6

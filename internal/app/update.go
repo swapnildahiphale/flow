@@ -6,7 +6,6 @@ import (
 	"flow/internal/flowdb"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -29,10 +28,6 @@ func cmdUpdate(args []string) int {
 	fmt.Fprintf(os.Stderr, "error: unknown update target %q (expected 'task' or 'project')\n", args[0])
 	return 2
 }
-
-// sessionUUIDRe mirrors claude's --session-id contract: standard v4
-// UUID, lowercase hex, with the version/variant bits enforced.
-var sessionUUIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 // cmdUpdateTask implements `flow update task <ref> [--work-dir <path>]
 // [--mkdir] [--status <s>] [--assignee <name>] [--due-date <date>]
@@ -156,6 +151,30 @@ func cmdUpdateTask(args []string) int {
 
 	now := flowdb.NowISO()
 	if absWorkDir != "" {
+		// Invariant: any task with a session_id has work_dir ==
+		// the cwd that session was created at. Allow a work_dir
+		// change while a session is bound ONLY when the new
+		// path satisfies the invariant (i.e. the harness's on-disk
+		// transcript actually lives there). That makes "fix an
+		// invariant-violating row" a supported path: the user
+		// points work_dir at the cwd the harness was really
+		// started in.
+		if absWorkDir != task.WorkDir && task.SessionID.Valid && task.SessionID.String != "" {
+			h, hErr := harnessForTask(task)
+			if hErr != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", hErr)
+				return 1
+			}
+			if err := h.ValidateSession(absWorkDir, task.SessionID.String); err != nil {
+				fmt.Fprintf(os.Stderr,
+					"error: can't move task %q's work_dir to %q while session %s is attached — the harness transcript isn't there:\n"+
+						"  %v\n"+
+						"to change work_dir without losing the session, point it at where the harness was actually started. "+
+						"to abandon the session entirely, release it first via `flow done %s` (or re-bootstrap with `flow do %s --fresh`), then re-run this update.\n",
+					task.Slug, absWorkDir, task.SessionID.String, err, task.Slug, task.Slug)
+				return 1
+			}
+		}
 		if _, err := db.Exec(
 			`UPDATE tasks SET work_dir=?, updated_at=? WHERE slug=?`,
 			absWorkDir, now, task.Slug,
