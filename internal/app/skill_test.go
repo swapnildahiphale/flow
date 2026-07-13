@@ -65,6 +65,7 @@ func withTempHome(t *testing.T) string {
 	oldHome := os.Getenv("HOME")
 	os.Setenv("HOME", dir)
 	t.Cleanup(func() { os.Setenv("HOME", oldHome) })
+	clearAmbientHarnessEnv(t)
 	return dir
 }
 
@@ -576,5 +577,45 @@ func TestPlaybookRunBootstrapMentionsPersistAdjustments(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("playbook-run bootstrap prompt missing %q; got:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestCursorSkillMentionsBindHereAndAgentsWindow(t *testing.T) {
+	got := string(embeddedCursorSkill)
+	for _, want := range []string{"Agents Window", "flow do --here", "CURSOR_CONVERSATION_ID", "name: flow-cursor"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("cursor skill missing %q", want)
+		}
+	}
+}
+
+func TestSkillInstallUsesCursorContentWhenAmbient(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CURSOR_CONVERSATION_ID", "627189e8-5e30-424b-bf68-44301c4e201f")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	if rc := cmdSkill([]string{"install", "--skip-hook"}); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".cursor", "skills", "flow-cursor", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "Agents Window") {
+		t.Fatalf("installed skill is not cursor-flavored")
+	}
+}
+
+func TestSkillInstallHarnessFlagCursor(t *testing.T) {
+	home := withTempHome(t)
+	if rc := cmdSkill([]string{"install", "--harness", "cursor", "--skip-hook"}); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".cursor", "skills", "flow-cursor", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "Agents Window") {
+		t.Fatalf("installed skill is not cursor-flavored")
 	}
 }

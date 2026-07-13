@@ -49,8 +49,9 @@ install: build
 					echo "Skipped. Add the line to $$rc_file yourself, or invoke flow with the full path: $(INSTALL_DIR)/$(BINARY)" ;; \
 			esac ;; \
 	esac
-	@# Install skill + SessionStart hook
-	@./$(BINARY) skill install --force
+	@# Install skills for both harnesses (claude hooks; cursor is skill-only).
+	@./$(BINARY) skill install --force --harness claude
+	@./$(BINARY) skill install --force --harness cursor --skip-hook
 	@echo ""
 	@echo "Run 'flow init' to create ~/.flow/ and the database."
 

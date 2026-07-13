@@ -102,7 +102,7 @@ func cmdDo(args []string) int {
 	fresh := fs.Bool("fresh", false, "discard existing session and re-bootstrap")
 	dangerSkip := fs.Bool("dangerously-skip-permissions", false, "skip per-tool approval prompts in the spawned harness")
 	force := fs.Bool("force", false, "open even if the task's Claude session is already running elsewhere")
-	here := fs.Bool("here", false, "bind THIS Claude session to the task (no new tab); requires running inside a Claude Code session")
+	here := fs.Bool("here", false, "bind THIS agent session to the task (no new tab); requires running inside a harness session")
 	auto := fs.Bool("auto", false, "run headlessly in the background (no tab, no human); the session self-completes via `flow done`. Implies --dangerously-skip-permissions")
 	withInstr := fs.String("with", "", "inject `<instruction>` as the first user message after the bootstrap/resume")
 	withFile := fs.String("with-file", "", "inject 'read instructions at <path>' (mutually exclusive with --with)")
@@ -186,6 +186,14 @@ func cmdDo(args []string) int {
 	h, err := harnessForSpawn(task)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	// Cursor Agents Window is bind-here-only — refuse spawn, --auto, and
+	// $FLOW_TERM=bg before any session machinery runs.
+	if h.Name() == harness.NameCursor {
+		fmt.Fprintln(os.Stderr,
+			"error: cursor Agents Window sessions cannot be spawned by flow — open a chat in Agents Window, then run: flow do --here <slug>")
 		return 1
 	}
 

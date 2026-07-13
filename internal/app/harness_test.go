@@ -2,6 +2,8 @@ package app
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -324,4 +326,49 @@ func TestHarnessForSpawn_AllPathsLandOnClaudeToday(t *testing.T) {
 		t.Error("harnessForSpawn return doesn't satisfy harness.Harness")
 	}
 	_ = claude.New() // import-keep
+}
+
+func TestHarnessForSkillCmdExplicitFlag(t *testing.T) {
+	clearAmbientHarnessEnv(t)
+	h, err := harnessForSkillCmd("cursor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Name() != harness.NameCursor {
+		t.Fatalf("got %q, want cursor", h.Name())
+	}
+}
+
+func TestHarnessForSkillCmdFLOW_HARNESS(t *testing.T) {
+	clearAmbientHarnessEnv(t)
+	t.Setenv("FLOW_HARNESS", "cursor")
+	h, err := harnessForSkillCmd("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Name() != harness.NameCursor {
+		t.Fatalf("got %q, want cursor", h.Name())
+	}
+}
+
+func TestHarnessForSkillCmdPrefersExistingCursorInstall(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	clearAmbientHarnessEnv(t)
+
+	cursorDir := filepath.Join(home, ".cursor", "skills", "flow-cursor")
+	if err := os.MkdirAll(cursorDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cursorDir, "SKILL.md"), []byte("cursor"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := harnessForSkillCmd("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Name() != harness.NameCursor {
+		t.Fatalf("got %q, want cursor when only cursor skill exists", h.Name())
+	}
 }

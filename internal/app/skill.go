@@ -6,10 +6,32 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"flow/internal/harness"
 )
 
 //go:embed skill/SKILL.md
 var embeddedSkill []byte
+
+//go:embed skill/cursor/SKILL.md
+var embeddedCursorSkill []byte
+
+// skillContentFor returns the embedded skill bytes for the given harness.
+// Cursor ambient installs get the Agents Window–flavored skill; all other
+// harnesses get the default Claude-oriented skill.
+func skillContentFor(h harness.Harness) []byte {
+	if h != nil && h.Name() == harness.NameCursor {
+		return embeddedCursorSkill
+	}
+	return embeddedSkill
+}
+
+func skillLabelFor(h harness.Harness) string {
+	if h != nil && h.Name() == harness.NameCursor {
+		return "flow-cursor"
+	}
+	return "flow"
+}
 
 // hookCommand is the exact string the harness's settings.json
 // (settings.json / hooks.json depending on harness) records as the
@@ -25,8 +47,8 @@ const userPromptSubmitHookCommand = "flow hook user-prompt-submit"
 
 // readSkillVersion returns the version string recorded in the
 // harness's skill-version sidecar, or "" if missing/unreadable.
-func readSkillVersion() string {
-	p, err := defaultHarness().SkillVersionPath()
+func readSkillVersion(h harness.Harness) string {
+	p, err := h.SkillVersionPath()
 	if err != nil {
 		return ""
 	}
@@ -41,8 +63,8 @@ func readSkillVersion() string {
 // installed the current skill content. Errors are non-fatal —
 // failing to write the sidecar should never block a successful
 // skill install.
-func writeSkillVersion(v string) error {
-	p, err := defaultHarness().SkillVersionPath()
+func writeSkillVersion(h harness.Harness, v string) error {
+	p, err := h.SkillVersionPath()
 	if err != nil {
 		return err
 	}
@@ -80,14 +102,14 @@ func maybeAutoUpgradeSkill() {
 		// Not installed → user opted out; don't reinstall behind their back.
 		return
 	}
-	if readSkillVersion() == Version {
+	if readSkillVersion(h) == Version {
 		return
 	}
 	// Version mismatch — refresh skill bytes and the SessionStart hook.
-	if err := h.InstallSkill(embeddedSkill); err != nil {
+	if err := h.InstallSkill(skillContentFor(h)); err != nil {
 		return
 	}
-	_ = writeSkillVersion(Version)
+	_ = writeSkillVersion(h, Version)
 	_, _ = h.InstallSessionStartHook(hookCommand)
 	_, _ = h.InstallUserPromptSubmitHook(userPromptSubmitHookCommand)
 	fmt.Fprintf(os.Stderr, "flow: upgraded skill to %s\n", Version)
@@ -117,11 +139,16 @@ func skillInstall(args []string, forceDefault bool) int {
 	fs := flagSet("skill install")
 	force := fs.Bool("force", forceDefault, "overwrite an existing installation")
 	skipHook := fs.Bool("skip-hook", false, "don't auto-install the SessionStart hook")
+	harnessFlag := fs.String("harness", "", "target harness (claude|cursor); default: ambient, $FLOW_HARNESS, or existing install")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
-	h := defaultHarness()
+	h, err := harnessForSkillCmd(*harnessFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
 	dest, err := h.SkillInstallPath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -134,17 +161,21 @@ func skillInstall(args []string, forceDefault bool) int {
 		fmt.Fprintf(os.Stderr, "error: stat %s: %v\n", dest, err)
 		return 1
 	}
-	if err := h.InstallSkill(embeddedSkill); err != nil {
+	if err := h.InstallSkill(skillContentFor(h)); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	if err := writeSkillVersion(Version); err != nil {
+	if err := writeSkillVersion(h, Version); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not record skill version: %v\n", err)
 	}
-	fmt.Printf("installed flow skill to %s\n", dest)
+	fmt.Printf("installed %s skill to %s\n", skillLabelFor(h), dest)
 
 	if *skipHook {
 		fmt.Println("--skip-hook: leaving harness settings alone")
+		return 0
+	}
+	if h.Name() == harness.NameCursor {
+		fmt.Println("cursor harness: hooks not used — skill only (~/.claude/skills/flow is left for Claude Code)")
 		return 0
 	}
 	if added, err := h.InstallSessionStartHook(hookCommand); err != nil {
@@ -172,10 +203,15 @@ func skillInstall(args []string, forceDefault bool) int {
 func skillUninstall(args []string) int {
 	fs := flagSet("skill uninstall")
 	keepHook := fs.Bool("keep-hook", false, "don't remove the SessionStart hook")
+	harnessFlag := fs.String("harness", "", "target harness (claude|cursor); default: ambient, $FLOW_HARNESS, or existing install")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	h := defaultHarness()
+	h, err := harnessForSkillCmd(*harnessFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
 	dest, err := h.SkillInstallPath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

@@ -3,11 +3,13 @@ package app
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"flow/internal/flowdb"
 	"flow/internal/harness"
 	"flow/internal/harness/claude"
+	"flow/internal/harness/cursor"
 	"flow/internal/spawner"
 )
 
@@ -17,6 +19,7 @@ import (
 func allHarnesses() []harness.Harness {
 	return []harness.Harness{
 		claude.New(),
+		cursor.New(),
 		// codex.New(),    // wired when the codex adapter lands
 		// gemini.New(),   // wired when the gemini adapter lands
 	}
@@ -122,16 +125,70 @@ func harnessForSpawn(task *flowdb.Task) (harness.Harness, error) {
 }
 
 // defaultHarness returns the adapter for code paths that have no
-// task context (e.g. `flow init`, `flow skill install`, the
-// SessionStart hook handler before bind). Probes ambient first so a
-// user inside a codex/gemini shell gets the matching skill install;
-// otherwise claude. Always returns a concrete adapter — no error
-// path because there's no task pin to potentially mis-resolve.
+// task context (e.g. `flow init`, the SessionStart hook handler before
+// bind). Probes ambient first so a user inside a codex/gemini/cursor
+// shell gets the matching skill install; otherwise claude. Always
+// returns a concrete adapter — no error path because there's no task
+// pin to potentially mis-resolve.
+//
+// For `flow skill install|update|uninstall`, prefer harnessForSkillCmd
+// which also honors --harness, $FLOW_HARNESS, and an existing cursor
+// skill install (terminal updates without CURSOR_CONVERSATION_ID).
 func defaultHarness() harness.Harness {
 	if h := ambientHarness(); h != nil {
 		return h
 	}
 	return claude.New()
+}
+
+// harnessForSkillCmd picks the harness for skill install/update/uninstall.
+// Resolution order:
+//  1. --harness flag (explicit)
+//  2. $FLOW_HARNESS env (explicit)
+//  3. ambient session env (CURSOR_CONVERSATION_ID, etc.)
+//  4. existing skill on disk — only one of claude/cursor installed
+//  5. both installed + ~/.cursor exists → cursor (Agents Window user)
+//  6. default claude (first-time install back-compat)
+func harnessForSkillCmd(harnessFlag string) (harness.Harness, error) {
+	if harnessFlag != "" {
+		return harnessByName(harnessFlag)
+	}
+	if v := os.Getenv("FLOW_HARNESS"); v != "" {
+		return harnessByName(v)
+	}
+	if h := ambientHarness(); h != nil {
+		return h, nil
+	}
+	cursorH := cursor.New()
+	claudeH := claude.New()
+	cursorPath, err := cursorH.SkillInstallPath()
+	if err != nil {
+		return nil, err
+	}
+	claudePath, err := claudeH.SkillInstallPath()
+	if err != nil {
+		return nil, err
+	}
+	_, cursorErr := os.Stat(cursorPath)
+	_, claudeErr := os.Stat(claudePath)
+	cursorExists := cursorErr == nil
+	claudeExists := claudeErr == nil
+	if cursorExists && !claudeExists {
+		return cursorH, nil
+	}
+	if claudeExists && !cursorExists {
+		return claudeH, nil
+	}
+	if cursorExists && claudeExists {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			if _, err := os.Stat(filepath.Join(home, ".cursor")); err == nil {
+				return cursorH, nil
+			}
+		}
+		return claudeH, nil
+	}
+	return claudeH, nil
 }
 
 // liveSessionsForTasks returns a merged id→count map across every

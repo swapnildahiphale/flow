@@ -101,11 +101,11 @@ func cmdInit(args []string) int {
 		return 1
 	}
 	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
-		if err := h.InstallSkill(embeddedSkill); err != nil {
+		if err := h.InstallSkill(skillContentFor(h)); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			return 1
 		}
-		if err := writeSkillVersion(Version); err != nil {
+		if err := writeSkillVersion(h, Version); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not record skill version: %v\n", err)
 		}
 		fmt.Printf("installed flow skill to %s\n", skillPath)

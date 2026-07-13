@@ -9,6 +9,16 @@ import (
 	flowdb "flow/internal/flowdb"
 )
 
+// clearAmbientHarnessEnv unsets every registered harness session-id env
+// var so tests don't inherit ambient state from the parent process (e.g.
+// $CURSOR_CONVERSATION_ID when running inside Cursor Agents Window).
+func clearAmbientHarnessEnv(t *testing.T) {
+	t.Helper()
+	for _, h := range allHarnesses() {
+		t.Setenv(h.SessionIDEnvVar(), "")
+	}
+}
+
 func openTempDB(t *testing.T) *sql.DB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "flow.db")

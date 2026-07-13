@@ -25,6 +25,8 @@ func initTempFlowRoot(t *testing.T) string {
 		os.Setenv("FLOW_ROOT", oldRoot)
 		os.Setenv("HOME", oldHome)
 	})
+	// Strip ambient harness session ids — see clearAmbientHarnessEnv.
+	clearAmbientHarnessEnv(t)
 	return root
 }
 

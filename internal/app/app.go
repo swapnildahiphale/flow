@@ -91,9 +91,9 @@ func printUsage() {
 
 Setup:
   flow init
-  flow skill install [--force]
-  flow skill uninstall
-  flow skill update
+  flow skill install [--force] [--harness claude|cursor] [--skip-hook]
+  flow skill uninstall [--harness claude|cursor]
+  flow skill update [--harness claude|cursor] [--skip-hook]
 
 Create:
   flow add project "<name>" --work-dir <path> [--slug <s>] [--priority h|m|l] [--mkdir]
